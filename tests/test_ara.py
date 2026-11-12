@@ -1,4 +1,4 @@
-import importlib.machinery, importlib.util, io, json, pathlib, socket, sys, unittest, urllib.error, urllib.parse
+import contextlib, csv, importlib.machinery, importlib.util, io, os, tempfile, json, pathlib, socket, sys, unittest, urllib.error, urllib.parse
 sys.dont_write_bytecode = True
 _path = str(pathlib.Path(__file__).resolve().parent.parent / "ara")
 _loader = importlib.machinery.SourceFileLoader("ara", _path)
@@ -395,6 +395,49 @@ class AssignmentFilterTest(unittest.TestCase):
             with self.assertRaises(ara.ValidationError): ara.AssignmentFilter(args(**kw))
     def test_active_is_a_valid_assignment_type(self):
         ara.AssignmentFilter(args(assignment_type_filter="Active"))
+
+def result(assignments, **kw):
+    return ara.ScanResult(MG, "my-mg", "management-groups", "2026-01-01T00:00:00Z", assignments, **kw)
+
+class OutputHandlerTest(unittest.TestCase):
+    def test_json_file_name_and_content(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = ara.JSONOutputHandler(d).generate(result([ra()]))
+            self.assertEqual(os.path.basename(path), "role_assignments_my-mg.json")
+            data = json.load(open(path)); self.assertEqual(data["metadata"]["complete"], True)
+            self.assertEqual(data["role_assignments"][0]["principal_name"], "Ann")
+            self.assertEqual(os.listdir(d), ["role_assignments_my-mg.json"])
+    def test_incomplete_scan_writes_partial_and_keeps_complete_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = ara.JSONOutputHandler(d); good = h.generate(result([ra()]))
+            partial = h.generate(result([], failed_scopes=[{"scope": "/x", "error": "boom"}]))
+            self.assertEqual(os.path.basename(partial), "role_assignments_my-mg.partial.json")
+            self.assertEqual(len(json.load(open(good))["role_assignments"]), 1)
+    def test_scope_name_is_sanitised(self):
+        r = result([]); r.scope_name = "../a b/c"
+        self.assertEqual(ara.JSONOutputHandler("x").file_name(r), "role_assignments____a_b_c.json")
+    def test_csv_columns_are_fixed_even_without_resource_rows(self):
+        text = ara.CSVOutputHandler("x").render(result([ra()]))
+        self.assertEqual(text.splitlines()[0], "Name,Principal ID,Type,Role,Scope,Scope Path,Scope Type,Assignment Type,Resource Type,Start Date,End Date")
+    def test_csv_escapes_formulas_and_missing_names(self):
+        rows = list(csv.reader(io.StringIO(ara.CSVOutputHandler("x").render(result([ra(name="=HYPERLINK(1)"), ra(name=None)])))))
+        self.assertEqual((rows[1][0], rows[2][0]), ("'=HYPERLINK(1)", ""))
+    def test_unwritable_directory_raises_export_error(self):
+        with tempfile.NamedTemporaryFile() as f:
+            with self.assertRaises(ara.ExportError): ara.JSONOutputHandler(os.path.join(f.name, "sub")).generate(result([]))
+    def test_zero_rows_is_a_valid_complete_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(ara.JSONOutputHandler(d).generate(result([])).endswith("role_assignments_my-mg.json"))
+
+class ConsoleSummaryTest(unittest.TestCase):
+    def test_states_pim_failed_scopes_and_paths(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ara.ConsoleSummary().print(result([ra(), ra(role="Owner"), ra(role="Owner")], pim_skipped=True,
+                                              failed_scopes=[{"scope": "/subscriptions/x", "error": "boom"}]), ["/tmp/r.html"])
+        out = buf.getvalue()
+        self.assertLess(out.index("Owner"), out.index("Reader"))
+        for needle in ("PIM", "/subscriptions/x", "/tmp/r.html"): self.assertIn(needle, out)
 
 if __name__ == "__main__":
     unittest.main()

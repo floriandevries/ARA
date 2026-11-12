@@ -35,6 +35,7 @@ import argparse
 import asyncio
 import base64
 import csv
+import io
 import json
 import logging
 import os
@@ -48,6 +49,7 @@ import urllib.parse
 import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field, replace
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -1170,136 +1172,81 @@ class PrincipalResolver:
 
 # Output Handlers
 class OutputHandler(ABC):
-    """Abstract base class for output handlers."""
-    
+    """Renders a ScanResult to text and writes it atomically into the output directory."""
+    extension: str
+
+    def __init__(self, output_dir: str):
+        self.output_dir = output_dir
+
     @abstractmethod
-    def generate(self, results: ScanResult, **kwargs) -> None:
-        """Generate output in specific format."""
+    def render(self, results: ScanResult) -> str:
         pass
 
+    def file_name(self, results: ScanResult) -> str:
+        safe = re.sub(r'[^A-Za-z0-9_-]', '_', results.scope_name)
+        partial = "" if results.complete else ".partial"
+        return f"role_assignments_{safe}{partial}.{self.extension}"
 
-class SummaryOutputHandler(OutputHandler):
-    """Generate console summary output."""
-    
-    def generate(self, results: ScanResult, **kwargs) -> None:
-        """Generate detailed summary output."""
-        safe_print("\n" + "="*ARAConfig.SEPARATOR_LENGTH)
-        safe_print(f"📋 SUMMARY: Found {len(results.assignments)} role assignments "
-                  f"across {results.management_groups_scanned + results.subscriptions_scanned} scopes")
-        safe_print("="*ARAConfig.SEPARATOR_LENGTH)
-        
-        if not results.assignments:
-            safe_print("❌ No role assignments found.")
-            return
-        
-        # Group by role
-        by_role = {}
-        for assignment in results.assignments:
-            if assignment.role_name not in by_role:
-                by_role[assignment.role_name] = []
-            by_role[assignment.role_name].append(assignment)
-        
-        for role_name in sorted(by_role.keys()):
-            assignments = by_role[role_name]
-            safe_print(f"\n👤 Role: {role_name} ({len(assignments)} assignments)")
-            safe_print("-" * ARAConfig.SUBSECTION_SEPARATOR_LENGTH)
-            
-            for assignment in assignments[:5]:  # Show top 5
-                safe_print(f"   • {assignment.principal_name} ({assignment.principal_type})")
-                scope_display = f"     Scope: {assignment.scope_name} ({assignment.scope_type})"
-                if assignment.resource_type:
-                    scope_display += f" - {assignment.resource_type}"
-                safe_print(scope_display)
-            
-            if len(assignments) > 5:
-                safe_print(f"   ... and {len(assignments) - 5} more")
-        
-        safe_print()
+    def generate(self, results: ScanResult) -> str:
+        path = os.path.join(self.output_dir, self.file_name(results))
+        try:
+            os.makedirs(self.output_dir, exist_ok=True)
+            with open(path + ".tmp", 'w', encoding='utf-8', newline='') as f:
+                f.write(self.render(results))
+            os.replace(path + ".tmp", path)
+        except OSError as e:
+            raise ExportError(f"Failed to write {path}: {e}")
+        return path
 
 
 class JSONOutputHandler(OutputHandler):
-    """Generate JSON output."""
-    
-    def __init__(self, results_dir: str = ARAConfig.RESULTS_DIR):
-        """Initialize JSON handler."""
-        self.results_dir = results_dir
-        os.makedirs(self.results_dir, exist_ok=True)
-    
-    def generate(self, results: ScanResult, filename: Optional[str] = None, **kwargs) -> str:
-        """Write results to JSON file."""
-        output_data = self._build_json_structure(results)
-        
-        if not filename:
-            # Extract management group ID from scope
-            parts = results.scope.split('/')
-            mg_id = parts[-1] if parts else "unknown"
-            filename = f"role_assignments_{mg_id}.json"
-        
-        filepath = os.path.join(self.results_dir, filename)
-        
-        try:
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(output_data, f, indent=ARAConfig.JSON_INDENT, ensure_ascii=False)
-            logger.info(f"💾 JSON results saved to: {filepath}")
-            return filepath
-        except (OSError, TypeError, ValueError) as e:
-            raise ExportError(f"Failed to write JSON file: {e}")
-    
-    def _build_json_structure(self, results: ScanResult) -> Dict:
-        """Build JSON output structure."""
-        return results.to_dict()
+    extension = "json"
+
+    def render(self, results: ScanResult) -> str:
+        return json.dumps(results.to_dict(), indent=ARAConfig.JSON_INDENT)
+
 
 class CSVOutputHandler(OutputHandler):
-    """Generate CSV output."""
-    
-    def __init__(self, results_dir: str = ARAConfig.RESULTS_DIR):
-        """Initialize CSV handler."""
-        self.results_dir = results_dir
-        os.makedirs(self.results_dir, exist_ok=True)
-    
-    def generate(self, results: ScanResult, filename: Optional[str] = None, **kwargs) -> str:
-        """Write results to CSV file."""
-        if not filename:
-            # Extract management group ID from scope
-            parts = results.scope.split('/')
-            mg_id = parts[-1] if parts else "unknown"
-            filename = f"role_assignments_{mg_id}.csv"
-        
-        filepath = os.path.join(self.results_dir, filename)
-        
-        # Check if any assignments have resource_type (for conditional column)
-        has_resource_types = any(a.resource_type for a in results.assignments)
-        
-        try:
-            with open(filepath, 'w', newline='', encoding=ARAConfig.CSV_ENCODING) as f:
-                fieldnames = ['Name', 'Principal ID', 'Type', 'Role', 'Scope', 'Scope Type', 'Assignment Type']
-                if has_resource_types:
-                    fieldnames.append('Resource Type')
-                fieldnames.extend(['Start Date', 'End Date'])
-                
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writeheader()
-                
-                for assignment in sorted(results.assignments, key=lambda x: x.role_name):
-                    row = {
-                        'Name': assignment.principal_name,
-                        'Principal ID': assignment.principal_id,
-                        'Type': assignment.principal_type,
-                        'Role': assignment.role_name,
-                        'Scope': assignment.scope_name,
-                        'Scope Type': assignment.scope_type,
-                        'Assignment Type': assignment.assignment_type
-                    }
-                    if has_resource_types:
-                        row['Resource Type'] = assignment.resource_type or ''
-                    row['Start Date'] = assignment.start_date_time or ''
-                    row['End Date'] = assignment.end_date_time or ''
-                    writer.writerow(row)
-            
-            logger.info(f"💾 CSV results saved to: {filepath}")
-            return filepath
-        except (OSError, csv.Error) as e:
-            raise ExportError(f"Failed to write CSV file: {e}")
+    extension = "csv"
+    COLUMNS = ("Name", "Principal ID", "Type", "Role", "Scope", "Scope Path", "Scope Type",
+               "Assignment Type", "Resource Type", "Start Date", "End Date")
+
+    @staticmethod
+    def escape(value: Optional[str]) -> str:
+        """Neutralise spreadsheet formula injection."""
+        if value is None:
+            return ""
+        return "'" + value if value[:1] in ("=", "+", "-", "@") else value
+
+    def render(self, results: ScanResult) -> str:
+        buf = io.StringIO()
+        writer = csv.writer(buf, lineterminator="\n")
+        writer.writerow(self.COLUMNS)
+        for a in results.assignments:
+            writer.writerow([self.escape(v) for v in (
+                a.principal_name, a.principal_id, a.principal_type, a.role_name, a.scope_name, a.scope,
+                a.scope_type, a.assignment_type, a.resource_type, a.start_date_time, a.end_date_time)])
+        return buf.getvalue()
+
+
+class ConsoleSummary:
+    """Prints the scan outcome: counts, roles, gaps and written files."""
+
+    def print(self, results: ScanResult, paths: List[str]) -> None:
+        safe_print(f"Found {len(results.assignments)} role assignments in "
+                   f"{results.management_groups_scanned} management groups and "
+                   f"{results.subscriptions_scanned} subscriptions.")
+        roles = Counter(a.role_name for a in results.assignments)
+        for role, count in sorted(roles.items(), key=lambda kv: (-kv[1], kv[0])):
+            safe_print(f"  {count:>6}  {role}")
+        if results.pim_status != "included":
+            safe_print(f"PIM: {results.pim_status}")
+        if results.names != "resolved":
+            safe_print(f"Names: {results.names}")
+        for failed in results.failed_scopes:
+            safe_print(f"Failed scope: {failed['scope']}: {failed['error']}")
+        for path in paths:
+            safe_print(f"Written: {path}")
 
 
 # Main Application
@@ -1310,7 +1257,7 @@ class ARAApplication:
         """Initialize ARA application."""
         self.results_dir = results_dir
         self.output_handlers = {
-            'summary': SummaryOutputHandler(),
+            'summary': ConsoleSummary(),
             'json': JSONOutputHandler(results_dir),
             'csv': CSVOutputHandler(results_dir),
         }
@@ -1335,13 +1282,8 @@ class ARAApplication:
             results.filters_applied = assignment_filter.get_summary()
 
             # Generate outputs
-            if args.format == 'json':
-                self.output_handlers['json'].generate(results)
-            elif args.format == 'csv':
-                self.output_handlers['csv'].generate(results)
-            
-            # Always show summary
-            self.output_handlers['summary'].generate(results)
+            paths = [self.output_handlers[args.format].generate(results)] if args.format in ('json', 'csv') else []
+            self.output_handlers['summary'].print(results, paths)
             
             logger.info("🎉 ARA completed successfully!")
             return ARAConfig.EXIT_CODE_SUCCESS
