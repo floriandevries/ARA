@@ -107,6 +107,8 @@ class ARAConfig:
     EXIT_CODE_ERROR = 1
     EXIT_CODE_INTERRUPT = 130
     
+    ASSIGNMENT_TYPES = ("Active permanent", "Active time-bound", "Eligible permanent", "Eligible time-bound", "Active")
+
     # Scan depth levels
     DEPTH_MANAGEMENT_GROUPS = 'management-groups'
     DEPTH_SUBSCRIPTIONS = 'subscriptions'
@@ -395,7 +397,7 @@ class AssignmentFilter:
 class RoleAssignment:
     """Immutable role assignment information."""
     principal_id: str
-    principal_name: str
+    principal_name: Optional[str]
     principal_type: str
     role_name: str
     role_id: str
@@ -415,16 +417,59 @@ class RoleAssignment:
             raise ValidationError("Role name cannot be empty")
         if not self.scope:
             raise ValidationError("Scope cannot be empty")
-        valid_types = ("Active permanent", "Active time-bound", "Eligible permanent", "Eligible time-bound")
-        if self.assignment_type not in valid_types:
-            raise ValidationError(f"Assignment type must be one of {valid_types}, got: {self.assignment_type}")
-    
-    @property
-    def full_scope_path(self) -> str:
-        """Get full scope path for display."""
-        if self.scope_name:
-            return f"{self.scope_name} ({self.scope_type})"
-        return self.scope
+        if self.assignment_type not in ARAConfig.ASSIGNMENT_TYPES:
+            raise ValidationError(f"Assignment type must be one of {ARAConfig.ASSIGNMENT_TYPES}, got: {self.assignment_type}")
+
+
+@dataclass(frozen=True)
+class ScopeRef:
+    """A parsed --scope argument. kind is 'management-group', 'subscription' or 'guid'."""
+    path: str
+    kind: str
+    name: str
+
+
+class ScopeParser:
+    """Parses the --scope argument and resolves the default depth."""
+    _GUID = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+    _PREFIXED = re.compile(
+        r'^/?(?:providers/Microsoft\.Management/)?(?P<kind>managementGroups|subscriptions)/(?P<name>[^/]+)/?$',
+        re.IGNORECASE)
+    _BARE = re.compile(r'^(?P<name>[^/]+)$')
+    _GUID_RE = re.compile('^' + _GUID + '$', re.IGNORECASE)
+    VALID_FORMS = (
+        "my-mg", "managementGroups/my-mg", "/providers/Microsoft.Management/managementGroups/my-mg",
+        "<subscription-guid>", "subscriptions/<subscription-guid>", "/subscriptions/<subscription-guid>")
+
+    @staticmethod
+    def parse(text: str) -> ScopeRef:
+        error = ValidationError(f"Invalid scope '{text}'. Valid forms: " + ", ".join(ScopeParser.VALID_FORMS))
+        m = ScopeParser._PREFIXED.match(text.strip())
+        if m:
+            name = m.group('name')
+            if m.group('kind').lower() == 'subscriptions':
+                if not ScopeParser._GUID_RE.match(name):
+                    raise error
+                name = name.lower()
+                return ScopeRef(f"/subscriptions/{name}", 'subscription', name)
+            return ScopeRef(f"/providers/Microsoft.Management/managementGroups/{name}", 'management-group', name)
+        m = ScopeParser._BARE.match(text.strip())
+        if not m:
+            raise error
+        name = m.group('name')
+        if ScopeParser._GUID_RE.match(name):
+            return ScopeRef(f"/subscriptions/{name.lower()}", 'guid', name.lower())
+        return ScopeRef(f"/providers/Microsoft.Management/managementGroups/{name}", 'management-group', name)
+
+    @staticmethod
+    def resolve_depth(kind: str, depth: Optional[str]) -> str:
+        if kind == 'subscription':
+            if depth is None:
+                return ARAConfig.DEPTH_RESOURCE_GROUPS
+            if depth == ARAConfig.DEPTH_MANAGEMENT_GROUPS:
+                raise ValidationError(f"Depth '{depth}' is not valid for a subscription scope")
+            return depth
+        return depth or ARAConfig.DEPTH_MANAGEMENT_GROUPS
 
 
 @dataclass
@@ -433,9 +478,8 @@ class Scope:
     scope_path: str
     name: str
     scope_type: str  # 'Management Group', 'Subscription', 'Resource Group', or 'Resource'
-    depth: int = 0
-    parent_scope: Optional[str] = None
     resource_type: Optional[str] = None  # For individual resources (e.g., 'Microsoft.Compute/virtualMachines')
+    subscription_id: Optional[str] = None
     
     def __post_init__(self):
         """Validate scope data."""
@@ -447,70 +491,32 @@ class Scope:
         if self.scope_type not in valid_types:
             raise ValidationError(f"Invalid scope type: {self.scope_type}. Must be one of {valid_types}")
     
+    _MG_PATH = re.compile(r'^/providers/Microsoft\.Management/managementGroups/([^/]+)/?$', re.IGNORECASE)
+    _SUB_PATH = re.compile(r'^/subscriptions/([^/]+)(?:/(.*))?$', re.IGNORECASE)
+
     @staticmethod
-    def from_path(scope_path: str, depth: int = 0) -> 'Scope':
-        """Create a Scope object from a scope path."""
-        path_lower = scope_path.lower()
-        
-        if '/resourcegroups/' in path_lower:
-            parts = scope_path.split('/')
-            # Check if it's a resource or just a resource group
-            if len(parts) > 5 and '/providers/' in path_lower:
-                # It's a resource: /subscriptions/{id}/resourceGroups/{rg}/providers/{provider}/{type}/{name}
-                try:
-                    rg_index = next(i for i, p in enumerate(parts) if p.lower() == 'resourcegroups')
-                    provider_index = next(i for i, p in enumerate(parts) if p.lower() == 'providers' and i > rg_index)
-                    resource_name = parts[-1]
-                    resource_type = '/'.join(parts[provider_index+1:-1])
-                    return Scope(
-                        scope_path=scope_path,
-                        name=resource_name,
-                        scope_type='Resource',
-                        depth=depth,
-                        resource_type=resource_type
-                    )
-                except (StopIteration, IndexError):
-                    pass
-            # It's a resource group: /subscriptions/{id}/resourceGroups/{name}
-            try:
-                rg_index = next(i for i, p in enumerate(parts) if p.lower() == 'resourcegroups')
-                rg_name = parts[rg_index + 1] if rg_index + 1 < len(parts) else 'Unknown'
-                return Scope(
-                    scope_path=scope_path,
-                    name=rg_name,
-                    scope_type='Resource Group',
-                    depth=depth
-                )
-            except (StopIteration, IndexError):
-                pass
-        
-        if '/subscriptions/' in path_lower:
-            parts = scope_path.split('/')
-            sub_id = parts[-1] if parts else 'Unknown'
-            return Scope(
-                scope_path=scope_path,
-                name=sub_id,
-                scope_type='Subscription',
-                depth=depth
-            )
-        
-        if '/managementgroups/' in path_lower:
-            parts = scope_path.split('/')
-            mg_id = parts[-1] if parts else 'Unknown'
-            return Scope(
-                scope_path=scope_path,
-                name=mg_id,
-                scope_type='Management Group',
-                depth=depth
-            )
-        
-        # Default fallback
-        return Scope(
-            scope_path=scope_path,
-            name='Unknown',
-            scope_type='Subscription',
-            depth=depth
-        )
+    def from_path(path: str) -> 'Scope':
+        """Classify an ARM scope path. Raises ValidationError if it cannot."""
+        p = path.rstrip('/')
+        m = Scope._MG_PATH.match(p)
+        if m:
+            return Scope(p, m.group(1), 'Management Group')
+        m = Scope._SUB_PATH.match(p)
+        if not m:
+            raise ValidationError(f"Cannot classify scope path: '{path}'")
+        sub, rest = m.group(1), (m.group(2) or '')
+        if not rest:
+            return Scope(p, sub, 'Subscription', subscription_id=sub)
+        parts = rest.split('/')
+        if parts[0].lower() == 'resourcegroups':
+            if len(parts) == 2 and parts[1]:
+                return Scope(p, parts[1], 'Resource Group', subscription_id=sub)
+            parts = parts[2:]
+        if len(parts) >= 4 and parts[0].lower() == 'providers' and len(parts) % 2 == 0:
+            # providers/<namespace>/<type>/<name>[/<subtype>/<name>...]
+            rtype = '/'.join([parts[1]] + parts[2::2])
+            return Scope(p, parts[-1], 'Resource', resource_type=rtype, subscription_id=sub)
+        raise ValidationError(f"Cannot classify scope path: '{path}'")
 
 
 @dataclass
@@ -883,8 +889,7 @@ class ManagementGroupClient:
                 scope = Scope(
                     scope_path=f"/providers/Microsoft.Management/managementGroups/{parent_id}",
                     name=parent_name or parent_id,
-                    scope_type='Management Group',
-                    depth=depth
+                    scope_type='Management Group'
                 )
                 all_scopes.append(scope)
                 
@@ -902,8 +907,7 @@ class ManagementGroupClient:
                         subscription_scope = Scope(
                             scope_path=f"/subscriptions/{child_id}",
                             name=child_name,
-                            scope_type='Subscription',
-                            depth=depth + 1
+                            scope_type='Subscription'
                         )
                         all_scopes.append(subscription_scope)
                         
@@ -1123,8 +1127,7 @@ class ResourceGroupClient:
                 scope = Scope(
                     scope_path=rg_path,
                     name=rg_name,
-                    scope_type='Resource Group',
-                    depth=0
+                    scope_type='Resource Group'
                 )
                 resource_groups.append(scope)
             
@@ -1172,7 +1175,6 @@ class ResourceClient:
                     scope_path=resource_id,
                     name=resource_name,
                     scope_type='Resource',
-                    depth=0,
                     resource_type=resource_type
                 )
                 resources.append(scope)
@@ -1385,8 +1387,7 @@ class JSONOutputHandler(OutputHandler):
                 {
                     "scope_path": scope.scope_path,
                     "name": scope.name,
-                    "type": scope.scope_type,
-                    "depth": scope.depth
+                    "type": scope.scope_type
                 }
                 for scope in results.scanned_scopes
             ],
@@ -1607,8 +1608,7 @@ class ARAApplication:
                 subscription_scope = Scope(
                     scope_path=scope,
                     name=subscription_name,
-                    scope_type='Subscription',
-                    depth=0
+                    scope_type='Subscription'
                 )
                 all_scopes = [subscription_scope]
                 logger.info(f"✅ Ready to scan\n")
@@ -1634,7 +1634,7 @@ class ARAApplication:
                         continue
                     
                     results.add_scanned_scope(scope)
-                    indent = "  " * scope.depth
+                    indent = ""
                     logger.info(f"{indent}🔍 Scanning: {scope.name} ({scope.scope_type})")
                     
                     # Get direct assignments for current scope
