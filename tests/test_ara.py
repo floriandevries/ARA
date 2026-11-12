@@ -1,4 +1,4 @@
-import contextlib, csv, importlib.machinery, importlib.util, io, os, tempfile, json, pathlib, socket, sys, unittest, urllib.error, urllib.parse
+import contextlib, csv, importlib.machinery, importlib.util, io, os, tempfile, json, pathlib, re, socket, sys, unittest, urllib.error, urllib.parse
 sys.dont_write_bytecode = True
 _path = str(pathlib.Path(__file__).resolve().parent.parent / "ara")
 _loader = importlib.machinery.SourceFileLoader("ara", _path)
@@ -429,6 +429,35 @@ class OutputHandlerTest(unittest.TestCase):
     def test_zero_rows_is_a_valid_complete_file(self):
         with tempfile.TemporaryDirectory() as d:
             self.assertTrue(ara.JSONOutputHandler(d).generate(result([])).endswith("role_assignments_my-mg.json"))
+
+class HTMLReportTest(unittest.TestCase):
+    def html(self, rows, **kw): return ara.HTMLOutputHandler("x").render(result(rows, **kw))
+    def data(self, html):
+        m = re.search(r'<script type="application/json" id="ara-data">(.*?)</script>', html, re.S)
+        return json.loads(m.group(1))
+    def test_hostile_names_cannot_break_out(self):
+        html = self.html([ra(name='</script><script>alert(1)</script>'), ra(name='<img src=x onerror=alert(1)>')])
+        self.assertEqual(html.count("</script>"), 2)   # data block and the report script
+        self.assertNotIn("<img src=x", html)
+        self.assertEqual(self.data(html)["role_assignments"][0]["principal_name"], '</script><script>alert(1)</script>')
+    def test_line_separators_are_escaped(self):
+        self.assertNotIn("\u2028", self.html([ra(name="a\u2028b")]))
+    def test_report_script_never_builds_html_from_data(self):
+        for banned in ("innerHTML", "insertAdjacentHTML", "outerHTML", "document.write"):
+            self.assertNotIn(banned, ara.REPORT_TEMPLATE)
+    def test_no_external_requests(self):
+        self.assertIn("default-src 'none'", ara.REPORT_TEMPLATE)
+        self.assertIsNone(re.search(r"https?://", ara.REPORT_TEMPLATE))
+    def test_missing_name_and_report_block_are_embedded(self):
+        d = self.data(self.html([ra(name=None)]))
+        self.assertIsNone(d["role_assignments"][0]["principal_name"])
+        self.assertEqual(d["report"]["high_privilege_roles"], ["Owner", "User Access Administrator", "Role Based Access Control Administrator"])
+    def test_incomplete_scan_gets_partial_file_name(self):
+        r = result([], failed_scopes=[{"scope": "/x", "error": "e"}])
+        self.assertEqual(ara.HTMLOutputHandler("x").file_name(r), "role_assignments_my-mg.partial.html")
+    def test_application_writes_report_first(self):
+        _, files = run(app(result([ra()])), "--scope", "my-mg")
+        self.assertIn("role_assignments_my-mg.html", files)
 
 class ConsoleSummaryTest(unittest.TestCase):
     def test_states_pim_failed_scopes_and_paths(self):

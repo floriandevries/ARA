@@ -99,6 +99,7 @@ class ARAConfig:
     
     ASSIGNMENT_TYPES = ("Active permanent", "Active time-bound", "Eligible permanent", "Eligible time-bound", "Active")
     PRINCIPAL_TYPES = ("User", "Group", "ServicePrincipal", "ManagedIdentity", "ForeignGroup", "Device")
+    HIGH_PRIVILEGE_ROLES = ("Owner", "User Access Administrator", "Role Based Access Control Administrator")
 
     # Scan depth levels
     DEPTH_MANAGEMENT_GROUPS = 'management-groups'
@@ -1122,6 +1123,401 @@ class CSVOutputHandler(OutputHandler):
         return buf.getvalue()
 
 
+# Self-contained report page. Plain string: CSS and JS braces need no escaping; /*ARA_DATA*/ is replaced once.
+REPORT_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Azure role assignments exported by ARA.">
+<link rel="icon" href="data:,">
+<title>ARA report</title>
+<style>
+/* Hallmark · shape: app screen · genre: modern-minimal · theme: custom
+ * nav: none, a header carrying the scope and the scan facts · signature: the assignment table and its side panel · states: empty, no match, full
+ * axes: warm paper/system sans/teal · posture: restrained · contrast: pass · v2.0.0 */
+/* Hallmark · pre-emit critique: P4 H4 E4 S4 R5 V3 · weakest: V, it follows view A of the agreed mockup on purpose, so the table stays the first thing below the figures */
+:root {
+  color-scheme: light;
+  --color-paper: oklch(97.2% 0.006 95);
+  --color-paper-2: oklch(94.6% 0.008 95);
+  --color-raised: oklch(99% 0.004 95);
+  --color-ink: oklch(22% 0.012 95);
+  --color-muted: oklch(48% 0.012 95);
+  --color-edge: oklch(62% 0.012 95);
+  --color-rule: oklch(88.5% 0.01 95);
+  --color-accent: oklch(47% 0.1 175);
+  --color-accent-ink: oklch(98.5% 0.008 175);
+  --color-focus: oklch(49% 0.11 175);
+  --color-risk: oklch(50% 0.17 32);
+  --color-notice: oklch(94% 0.035 80);
+  --color-selection: oklch(88% 0.05 175);
+  --font-body: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --text-sm: 0.8333rem;
+  --text-md: 1rem;
+  --text-lg: 1.2rem;
+  --text-xl: 1.44rem;
+  --text-2xl: 1.728rem;
+  --space-3xs: 2px;
+  --space-2xs: 4px;
+  --space-xs: 8px;
+  --space-sm: 12px;
+  --space-md: 16px;
+  --space-lg: 24px;
+  --space-xl: 40px;
+  --space-2xl: 64px;
+  --radius-control: 6px;
+  --radius-well: 10px;
+  --control-h: 2.5rem;
+  --dur-micro: 120ms;
+  --dur-exit: 300ms;
+  --dur-long: 420ms;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in: cubic-bezier(0.7, 0, 0.84, 0);
+  --z-panel: 400;
+}
+*, *::before, *::after { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { overflow-x: clip; }
+html { scrollbar-color: var(--color-edge) var(--color-paper); }
+::selection { background: var(--color-selection); color: var(--color-ink); }
+body {
+  margin: 0;
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font: var(--text-md)/1.5 var(--font-body);
+}
+h1, h2, p, dl, dd, ul { margin: 0; }
+h1, h2 { font-weight: 600; line-height: 1.15; text-wrap: balance; overflow-wrap: break-word; min-width: 0; }
+.wrap { max-width: 85rem; margin-inline: auto; padding: var(--space-xl) var(--space-lg) var(--space-2xl); }
+
+.top { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: end; gap: var(--space-md) var(--space-xl); margin-bottom: var(--space-lg); }
+.top h1 { font-size: var(--text-xl); }
+.scope { font-size: var(--text-lg); overflow-wrap: break-word; }
+.facts { display: flex; flex-wrap: wrap; gap: var(--space-xs) var(--space-md); color: var(--color-muted); font-size: var(--text-sm); }
+.facts p + p { border-left: 1px solid var(--color-rule); padding-left: var(--space-md); }
+.risk { color: var(--color-risk); font-weight: 600; }
+
+.banner { background: var(--color-notice); border-radius: var(--radius-well); padding: var(--space-sm) var(--space-md); margin-bottom: var(--space-lg); display: grid; gap: var(--space-2xs); }
+
+.stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: var(--space-xl); }
+.stats div { display: flex; flex-direction: column-reverse; padding-inline: var(--space-lg); border-left: 1px solid var(--color-rule); }
+.stats div:first-child { padding-left: 0; border-left: 0; }
+.stats div:last-child { padding-right: 0; }
+.stats dt { font-size: var(--text-sm); color: var(--color-muted); }
+.stats dd { font-size: var(--text-2xl); font-weight: 600; line-height: 1.2; font-variant-numeric: tabular-nums; }
+
+.bar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-xs); margin-bottom: var(--space-sm); }
+.search {
+  flex: 1 1 18rem; min-width: 0; height: var(--control-h); padding-inline: var(--space-sm);
+  font: inherit; color: var(--color-ink); background: var(--color-raised);
+  border: 1px solid var(--color-edge); border-radius: var(--radius-control); caret-color: var(--color-accent);
+}
+.search::placeholder { color: var(--color-muted); }
+.search:focus-visible { outline: 2px solid var(--color-focus); outline-offset: -2px; }
+.btn {
+  position: relative; height: var(--control-h); padding-inline: var(--space-md);
+  font: inherit; font-size: var(--text-sm); white-space: nowrap; cursor: pointer;
+  color: var(--color-ink); background: transparent;
+  border: 1px solid var(--color-edge); border-radius: var(--radius-control);
+  transition: transform var(--dur-micro) var(--ease-out);
+}
+.btn::after { content: ""; position: absolute; inset: calc(-1 * var(--space-3xs)) 0; }
+.btn:hover { background: var(--color-paper-2); }
+.btn:active { transform: translateY(1px); }
+.btn:disabled { opacity: 0.55; cursor: not-allowed; }
+.btn[aria-pressed="true"] { background: var(--color-accent); border-color: var(--color-accent); color: var(--color-accent-ink); }
+.btn:focus-visible, .cell:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; }
+.count { color: var(--color-muted); font-size: var(--text-sm); margin-bottom: var(--space-xs); }
+
+.table-wrap { overflow-x: auto; }
+table { width: 100%; min-width: 48rem; border-collapse: collapse; }
+th { font-size: var(--text-sm); font-weight: 600; color: var(--color-muted); text-align: left; white-space: nowrap; padding: var(--space-xs) var(--space-sm); border-bottom: 1px solid var(--color-rule); }
+td { padding: var(--space-xs) var(--space-sm); border-bottom: 1px solid var(--color-rule); vertical-align: top; overflow-wrap: break-word; }
+th:first-child, td:first-child { position: sticky; left: 0; background: var(--color-paper); padding-left: 0; }
+tbody tr { cursor: pointer; }
+tbody tr:hover, tbody tr:hover td:first-child { background: var(--color-paper-2); }
+.cell {
+  display: flex; flex-direction: column; min-height: var(--control-h); padding: 0;
+  font: inherit; color: inherit; text-align: left; cursor: pointer;
+  background: none; border: 0; border-radius: var(--radius-control);
+}
+.cell:hover .main { text-decoration: underline; }
+.sub { display: block; color: var(--color-muted); font-size: var(--text-sm); }
+.none { color: var(--color-muted); }
+.more { margin-top: var(--space-md); }
+.empty { padding-block: var(--space-xl); display: grid; justify-items: start; gap: var(--space-sm); }
+
+.panel {
+  position: fixed; inset-block: 0; right: 0; width: min(28rem, 100%); overflow-y: auto; z-index: var(--z-panel);
+  background: var(--color-raised); border-left: 1px solid var(--color-rule); padding: var(--space-lg);
+  transform: translateX(100%); transition: transform var(--dur-exit) var(--ease-in);
+}
+.panel.open { transform: none; transition-duration: var(--dur-long); transition-timing-function: var(--ease-out); }
+.panel-head { display: flex; justify-content: space-between; align-items: start; gap: var(--space-md); }
+.panel h2 { font-size: var(--text-lg); }
+.panel-id { color: var(--color-muted); font-size: var(--text-sm); overflow-wrap: anywhere; margin-top: var(--space-2xs); }
+.panel ul { list-style: none; padding: 0; margin-top: var(--space-md); border-top: 1px solid var(--color-rule); }
+.panel li { padding-block: var(--space-sm); border-bottom: 1px solid var(--color-rule); }
+.panel li strong { display: block; font-weight: 600; overflow-wrap: break-word; }
+
+footer { margin-top: var(--space-xl); color: var(--color-muted); font-size: var(--text-sm); }
+
+@media (max-width: 60rem) {
+  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); row-gap: var(--space-lg); }
+  .stats div:nth-child(odd) { padding-left: 0; border-left: 0; }
+  .stats div:nth-child(even) { padding-right: 0; }
+}
+@media (max-width: 40rem) {
+  .wrap { padding-inline: var(--space-md); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .btn, .panel, .panel.open { transition: none; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div>
+      <h1>ARA</h1>
+      <p class="scope" id="scope"></p>
+    </div>
+    <div class="facts">
+      <p id="scanned"></p>
+      <p id="coverage"></p>
+      <p id="state"></p>
+    </div>
+  </header>
+  <noscript><p>This report needs JavaScript to show the assignments.</p></noscript>
+  <div class="banner" id="banner" role="status" hidden></div>
+  <dl class="stats" id="stats"></dl>
+  <div class="bar">
+    <input class="search" id="search" type="search" name="q" autocomplete="off" placeholder="Search principal, ID, role, scope or type" aria-label="Search assignments">
+    <button class="btn" type="button" data-chip="high" aria-pressed="false">High privilege</button>
+    <button class="btn" type="button" data-chip="eligible" aria-pressed="false">Eligible</button>
+    <button class="btn" type="button" data-chip="users" aria-pressed="false">Users only</button>
+  </div>
+  <p class="count" id="count" aria-live="polite"></p>
+  <div class="table-wrap" id="table">
+    <table>
+      <thead><tr><th scope="col">Principal</th><th scope="col">Role</th><th scope="col">Scope</th><th scope="col">Assignment</th><th scope="col">Ends</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+  <div class="empty" id="empty" hidden>
+    <p id="empty-text"></p>
+    <button class="btn" id="clear" type="button">Clear filters</button>
+  </div>
+  <button class="btn more" id="more" type="button" hidden>Show more</button>
+  <footer><p id="about"></p></footer>
+</div>
+<aside class="panel" id="panel" aria-labelledby="panel-title" inert>
+  <div class="panel-head">
+    <h2 id="panel-title"></h2>
+    <button class="btn" id="close" type="button">Close</button>
+  </div>
+  <p class="sub" id="panel-sub"></p>
+  <p class="panel-id" id="panel-id"></p>
+  <ul id="panel-list"></ul>
+</aside>
+<script type="application/json" id="ara-data">/*ARA_DATA*/</script>
+<script>
+(function () {
+  "use strict";
+  // Every tenant-supplied string goes through textContent or a text node, never through markup.
+  const data = JSON.parse(document.getElementById("ara-data").textContent);
+  const meta = data.metadata, report = data.report, rows = data.role_assignments;
+  const HIGH = new Set(report.high_privilege_roles);
+  const PAGE = 200;
+  const state = { q: "", chips: new Set(), list: rows, limit: PAGE, trigger: null };
+  const $ = (id) => document.getElementById(id);
+  const day = new Intl.DateTimeFormat(undefined, { year: "numeric", month: "short", day: "numeric" });
+  const stamp = new Intl.DateTimeFormat(undefined, { year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", timeZoneName: "short" });
+
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = text;
+    return e;
+  }
+  const plural = (n, one, many) => n + " " + (n === 1 ? one : many);
+  const when = (iso, fmt) => { const d = new Date(iso); return isNaN(d) ? iso : fmt.format(d); };
+  const who = (r) => r.principal_name || r.principal_id;
+  const scopeKind = (r) => r.resource_type || r.scope_type;
+  const high = (r) => HIGH.has(r.role_name);
+  const eligible = (r) => r.assignment_type.indexOf("Eligible") === 0;
+  const ends = (r) => r.end_date_time ? when(r.end_date_time, day) : (r.assignment_type === "Active" ? "Not known" : "No end date");
+  rows.forEach((r) => {
+    r.search = [r.principal_name, r.principal_id, r.role_name, r.scope_name, r.scope, r.principal_type,
+      r.scope_type, r.resource_type, r.assignment_type].filter(Boolean).join("\n").toLowerCase();
+  });
+
+  // Heading
+  const scopeName = meta.scope.split("/").filter(Boolean).pop() || meta.scope;
+  $("scope").textContent = scopeName;
+  document.title = "ARA, " + scopeName;
+  const time = el("time", null, when(meta.scan_timestamp, stamp));
+  time.dateTime = meta.scan_timestamp;
+  $("scanned").append("Scanned ", time);
+  $("coverage").textContent = plural(meta.management_groups_scanned, "management group", "management groups") + ", " +
+    plural(meta.subscriptions_scanned, "subscription", "subscriptions");
+  $("state").textContent = meta.complete ? "Scan complete" : "Scan incomplete";
+  if (!meta.complete) $("state").className = "risk";
+  $("about").textContent = "ARA " + meta.version + ", " + report.descriptor + ". " + report.slogan;
+
+  // Banner: one sentence per condition
+  const notes = [];
+  const failed = meta.failed_scopes.length;
+  if (failed) notes.push("The scan is incomplete: " + plural(failed, "scope", "scopes") + " could not be read.");
+  else if (!meta.complete && !report.filters_not_applied) notes.push("The scan is incomplete: it stopped before every scope was read.");
+  if (meta.pim === "skipped") notes.push("PIM was skipped, so every assignment has the type Active.");
+  else if (meta.pim === "partial") notes.push("PIM data could not be read on " + plural(meta.pim_unavailable_scopes.length, "scope", "scopes") + ", so assignments there have the type Active.");
+  else if (meta.pim === "unavailable") notes.push("PIM data could not be read, so every assignment has the type Active.");
+  if (meta.names === "partial") notes.push("Some principal names could not be read; those rows show the principal ID.");
+  else if (meta.names === "unavailable") notes.push("Principal names could not be read; rows show the principal ID.");
+  if (report.filters_not_applied) notes.push("Filters were not applied because principal names are incomplete; the report shows every assignment found.");
+  notes.forEach((n) => $("banner").appendChild(el("p", null, n)));
+  $("banner").hidden = notes.length === 0;
+
+  // Figures
+  const unknown = new Set(rows.filter((r) => r.principal_name === "Unknown").map((r) => r.principal_id)).size;
+  [[rows.length, "direct assignments", false],
+   [rows.filter(high).length, "high-privilege assignments", true],
+   [rows.filter(eligible).length, "eligible through PIM", false],
+   [unknown, "principals not found in the directory", true]].forEach(([n, label, warn]) => {
+    const box = el("div");
+    box.append(el("dt", null, label), el("dd", warn && n ? "risk" : null, String(n)));
+    $("stats").appendChild(box);
+  });
+
+  // Table
+  function cellButton(kind, main, sub) {
+    const b = el("button", "cell");
+    b.type = "button";
+    b.dataset.open = kind;
+    b.append(el("span", "main", main), el("span", "sub", sub));
+    return b;
+  }
+  function cell(...children) { const td = el("td"); td.append(...children); return td; }
+  function row(r) {
+    const tr = el("tr");
+    tr.record = r;
+    const end = r.end_date_time ? el("time", null, ends(r)) : el("span", "none", ends(r));
+    if (r.end_date_time) end.dateTime = r.end_date_time;
+    tr.append(
+      cell(cellButton("principal", who(r), r.principal_type)),
+      cell(el("span", high(r) ? "risk" : null, r.role_name)),
+      cell(cellButton("scope", r.scope_name, scopeKind(r))),
+      cell(r.assignment_type),
+      cell(end));
+    return tr;
+  }
+  function draw(from) {
+    const frag = document.createDocumentFragment();
+    state.list.slice(from, state.limit).forEach((r) => frag.appendChild(row(r)));
+    if (from === 0) $("rows").replaceChildren(frag); else $("rows").appendChild(frag);
+    const none = state.list.length === 0;
+    $("table").hidden = none;
+    $("empty").hidden = !none;
+    $("clear").hidden = rows.length === 0;
+    $("empty-text").textContent = rows.length ? "No assignments match the search and filters." : "This scan found no role assignments.";
+    $("more").hidden = state.list.length <= state.limit;
+  }
+  function update() {
+    state.list = rows.filter((r) => (!state.q || r.search.indexOf(state.q) !== -1) &&
+      (!state.chips.has("high") || high(r)) &&
+      (!state.chips.has("eligible") || eligible(r)) &&
+      (!state.chips.has("users") || r.principal_type === "User"));
+    state.limit = PAGE;
+    $("count").textContent = state.list.length + " of " + rows.length + " assignments";
+    draw(0);
+  }
+
+  // Side panel
+  function open(kind, r, trigger) {
+    const byPrincipal = kind === "principal";
+    const items = byPrincipal ? rows.filter((x) => x.principal_id === r.principal_id)
+      : rows.filter((x) => x.scope.toLowerCase() === r.scope.toLowerCase());
+    $("panel-title").textContent = byPrincipal ? who(r) : r.scope_name;
+    $("panel-sub").textContent = (byPrincipal ? r.principal_type : scopeKind(r)) + ", " + plural(items.length, "assignment", "assignments");
+    $("panel-id").textContent = byPrincipal ? r.principal_id : r.scope;
+    const list = document.createDocumentFragment();
+    items.forEach((x) => {
+      const li = el("li");
+      const detail = (byPrincipal ? scopeKind(x) : x.principal_type) + ", " + x.assignment_type +
+        (x.end_date_time ? ", ends " + ends(x) : "");
+      li.append(el("strong", null, byPrincipal ? x.scope_name : who(x)), el("span", high(x) ? "risk" : null, x.role_name), el("span", "sub", detail));
+      list.appendChild(li);
+    });
+    $("panel-list").replaceChildren(list);
+    state.trigger = trigger;
+    $("panel").inert = false;
+    $("panel").classList.add("open");
+    $("panel").scrollTop = 0;
+    $("close").focus();
+  }
+  function close() {
+    if ($("panel").inert) return;
+    $("panel").classList.remove("open");
+    $("panel").inert = true;
+    if (state.trigger && state.trigger.isConnected) state.trigger.focus();
+  }
+
+  // Events
+  $("search").addEventListener("input", (e) => { state.q = e.target.value.trim().toLowerCase(); update(); });
+  document.querySelectorAll("[data-chip]").forEach((b) => b.addEventListener("click", () => {
+    const on = !state.chips.has(b.dataset.chip);
+    if (on) state.chips.add(b.dataset.chip); else state.chips.delete(b.dataset.chip);
+    b.setAttribute("aria-pressed", String(on));
+    update();
+  }));
+  $("clear").addEventListener("click", () => {
+    state.q = ""; $("search").value = ""; state.chips.clear();
+    document.querySelectorAll("[data-chip]").forEach((b) => b.setAttribute("aria-pressed", "false"));
+    update();
+  });
+  $("more").addEventListener("click", () => { const from = state.limit; state.limit += PAGE; draw(from); });
+  $("rows").addEventListener("click", (e) => {
+    const tr = e.target.closest("tr");
+    if (!tr) return;
+    const scope = e.target.closest("[data-open=scope]");
+    open(scope ? "scope" : "principal", tr.record, scope || tr.querySelector("[data-open=principal]"));
+  });
+  $("close").addEventListener("click", close);
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
+
+  update();
+})();
+</script>
+</body>
+</html>
+"""
+
+
+class HTMLOutputHandler(OutputHandler):
+    extension = "html"
+
+    @staticmethod
+    def embed(data: Dict) -> str:
+        """JSON that cannot end its <script> element or break a JS string."""
+        text = json.dumps(data, ensure_ascii=False)
+        for ch in ("<", ">", "&", " ", " "):
+            text = text.replace(ch, "\\u%04x" % ord(ch))
+        return text
+
+    def render(self, results: ScanResult) -> str:
+        data = results.to_dict()
+        data["report"] = {
+            "high_privilege_roles": list(ARAConfig.HIGH_PRIVILEGE_ROLES),
+            "descriptor": ARAConfig.DESCRIPTOR,
+            "slogan": ARAConfig.SLOGAN,
+            "filters_not_applied": results.filters_not_applied,  # not in metadata, but the banner needs it
+        }
+        return REPORT_TEMPLATE.replace("/*ARA_DATA*/", self.embed(data))
+
+
 class ConsoleSummary:
     """Prints the scan outcome: counts, roles, gaps and written files."""
 
@@ -1161,7 +1557,7 @@ class ARAApplication:
                        show_progress=not (args.no_progress or args.debug))
 
     def handlers(self, args: argparse.Namespace) -> List[OutputHandler]:
-        handlers = [JSONOutputHandler(args.output_dir)]  # type: List[OutputHandler]
+        handlers = [HTMLOutputHandler(args.output_dir), JSONOutputHandler(args.output_dir)]  # type: List[OutputHandler]
         if args.format == "csv":
             handlers.append(CSVOutputHandler(args.output_dir))
         return handlers
@@ -1236,7 +1632,7 @@ Authentication (tried in order):
   Principal names come from Microsoft Graph: AZURE_GRAPH_TOKEN, else Azure CLI.
 
 Output:
-  A JSON file is always written to --output-dir (default: results).
+  An HTML report and a JSON file are always written to --output-dir (default: results).
   An incomplete scan writes *.partial.* files.
 
 Exit codes:
@@ -1294,7 +1690,7 @@ Examples:
         '--format',
         choices=['csv'],
         default=None,
-        help='Also write a CSV file next to the JSON file'
+        help='Also write a CSV file next to the HTML and JSON files'
     )
     
     parser.add_argument(
