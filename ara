@@ -35,7 +35,6 @@ import argparse
 import asyncio
 import base64
 import csv
-import functools
 import json
 import logging
 import os
@@ -50,7 +49,7 @@ import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 __version__ = "2.1.0"
 __author__ = "fjdev"
@@ -838,143 +837,87 @@ class AzureAPIClient(HttpClient):
         return self.BASE + path
 
 
-class ManagementGroupClient:
-    """Client for Azure Management Group operations."""
-    
-    def __init__(self, api_client: AzureAPIClient):
-        """Initialize management group client."""
-        self.api_client = api_client
-    
-    def get_management_group_id_from_scope(self, scope: str) -> str:
-        """Extract management group ID from scope."""
-        parts = scope.split('/')
-        try:
-            mg_index = parts.index('managementGroups')
-            return parts[mg_index + 1]
-        except (ValueError, IndexError):
-            raise ValidationError(
-                f"Invalid scope format: {scope}. "
-                f"Expected format: /providers/Microsoft.Management/managementGroups/{{mg-id}}"
-            )
-    
-    def get_management_group_hierarchy(self, mg_id: str) -> List[Scope]:
-        """Get all child management groups and subscriptions recursively."""
-        all_scopes = []
-        
-        def extract_children_recursive(parent_id: str, parent_name: str, depth: int = 0):
-            """Recursively extract management groups and subscriptions."""
-            try:
-                mg_data = self._get_management_group(parent_id)
-                
-                # Add current management group
-                scope = Scope(
-                    scope_path=f"/providers/Microsoft.Management/managementGroups/{parent_id}",
-                    name=parent_name or parent_id,
-                    scope_type='Management Group'
-                )
-                all_scopes.append(scope)
-                
-                # Process children
-                children = mg_data.get('properties', {}).get('children', [])
-                for child in children:
-                    child_type = child.get('type', '')
-                    child_id = child.get('name', '')
-                    child_name = child.get('displayName', child_id)
-                    
-                    # Handle both formats: with and without leading slash
-                    if 'managementGroups' in child_type:
-                        extract_children_recursive(child_id, child_name, depth + 1)
-                    elif 'subscriptions' in child_type.lower():
-                        subscription_scope = Scope(
-                            scope_path=f"/subscriptions/{child_id}",
-                            name=child_name,
-                            scope_type='Subscription'
-                        )
-                        all_scopes.append(subscription_scope)
-                        
-            except Exception as e:
-                logger.warning(f"Could not retrieve children for {parent_id}: {e}")
-        
-        extract_children_recursive(mg_id, mg_id, 0)
-        return all_scopes
-    
-    def _get_management_group(self, mg_id: str) -> Dict:
-        """Get management group details."""
-        url = (f"{ARAConfig.AZURE_MANAGEMENT_URL}/providers/Microsoft.Management/"
-               f"managementGroups/{mg_id}?api-version={ARAConfig.MGMT_GROUP_API_VERSION}"
-               f"&$expand=children&$recurse=false")
-        return self.api_client.get(url)
+class HierarchyClient:
+    """Reads the management group tree and subscription details."""
+
+    def __init__(self, api: AzureAPIClient):
+        self.api = api
+
+    def management_group_tree(self, mg_id: str) -> Tuple[List[Scope], List[Scope]]:
+        """Management groups (root first) and subscriptions under mg_id, from one recursive call."""
+        root = self.api.get(self.api.url(f"/providers/Microsoft.Management/managementGroups/{mg_id}"), {
+            "api-version": ARAConfig.MGMT_GROUP_API_VERSION, "$expand": "children", "$recurse": "true"})
+        props = root.get('properties') or {}
+        mgs = [Scope(f"/providers/Microsoft.Management/managementGroups/{mg_id}",
+                     props.get('displayName') or mg_id, 'Management Group')]
+        subs = []  # type: List[Scope]
+
+        def walk(children):
+            for child in children or []:
+                child_type, child_id = child.get('type', ''), child.get('name', '')
+                name = child.get('displayName') or child_id
+                if child_type.endswith('/managementGroups'):
+                    mgs.append(Scope(f"/providers/Microsoft.Management/managementGroups/{child_id}",
+                                     name, 'Management Group'))
+                    walk(child.get('children'))
+                elif child_type == '/subscriptions':
+                    subs.append(Scope(f"/subscriptions/{child_id}", name, 'Subscription',
+                                      subscription_id=child_id))
+
+        walk(props.get('children'))
+        return mgs, subs
+
+    def subscription(self, subscription_id: str) -> Scope:
+        """The subscription with its display name. APIError passes through."""
+        data = self.api.get(self.api.url(f"/subscriptions/{subscription_id}"),
+                            {"api-version": ARAConfig.AZURE_API_VERSION})
+        return Scope(f"/subscriptions/{subscription_id}", data.get('displayName') or subscription_id,
+                     'Subscription', subscription_id=subscription_id)
 
 
-class SubscriptionClient:
-    """Client for Azure Subscription operations."""
-    
-    def __init__(self, api_client: AzureAPIClient):
-        """Initialize subscription client."""
-        self.api_client = api_client
-    
-    def get_subscription_details(self, subscription_id: str) -> Dict:
-        """Get subscription details including display name."""
-        url = (f"{ARAConfig.AZURE_MANAGEMENT_URL}/subscriptions/{subscription_id}"
-               f"?api-version=2020-01-01")
-        try:
-            return self.api_client.get(url)
-        except Exception as e:
-            logger.warning(f"Could not retrieve subscription details for {subscription_id}: {e}")
-            return {}
-    
-    def get_subscription_display_name(self, subscription_id: str) -> str:
-        """Get the display name for a subscription."""
-        details = self.get_subscription_details(subscription_id)
-        return details.get('displayName', subscription_id)
+class AssignmentCollector:
+    """Lists role assignments once per management group or subscription, and role names per scope."""
+
+    def __init__(self, api: AzureAPIClient):
+        self.api = api
+
+    def _list(self, scope_path: str, kind: str, params: Dict) -> List[Dict]:
+        params = dict(params, **{"api-version": ARAConfig.AUTH_API_VERSION})
+        return self.api.get_all(self.api.url(f"{scope_path}/providers/Microsoft.Authorization/{kind}"), params)
+
+    @staticmethod
+    def inside(scope_path: str, container_path: str) -> bool:
+        """True when scope_path is container_path or below it, ignoring case."""
+        scope, container = scope_path.lower(), container_path.lower().rstrip('/')
+        return scope == container or scope.startswith(container + '/')
+
+    def for_management_group(self, mg: Scope) -> List[Dict]:
+        rows = self._list(mg.scope_path, "roleAssignments", {"$filter": "atScope()"})
+        return [r for r in rows if r.get('properties', {}).get('scope', '').lower() == mg.scope_path.lower()]
+
+    def for_subscription(self, sub: Scope) -> List[Dict]:
+        rows = self._list(sub.scope_path, "roleAssignments", {})
+        return [r for r in rows if self.inside(r.get('properties', {}).get('scope', ''), sub.scope_path)]
+
+    def role_names(self, scope_path: str) -> Dict[str, str]:
+        """Role definition GUID (lowercase) to role name."""
+        return {d['id'].rsplit('/', 1)[-1].lower(): d['properties']['roleName']
+                for d in self._list(scope_path, "roleDefinitions", {})}
 
 
-class RoleAssignmentClient:
-    """Client for Azure Role Assignment operations."""
-    
-    def __init__(self, api_client: AzureAPIClient):
-        """Initialize role assignment client."""
-        self.api_client = api_client
-        self._role_definition_cache = {}
-    
-    def get_direct_assignments_for_scope(self, scope: Scope) -> List[Dict]:
-        """Get only direct role assignments for a specific scope."""
-        assignments_data = []
-        
-        try:
-            url = (f"{ARAConfig.AZURE_MANAGEMENT_URL}{scope.scope_path}/"
-                   f"providers/Microsoft.Authorization/roleAssignments"
-                   f"?api-version={ARAConfig.AUTH_API_VERSION}")
-            
-            data = self.api_client.get(url)
-            
-            for assignment in data.get('value', []):
-                # Only include assignments directly assigned to this scope
-                assignment_scope = assignment.get('properties', {}).get('scope', '').lower()
-                if assignment_scope != scope.scope_path.lower():
-                    continue
-                
-                assignments_data.append(assignment)
-                
-        except Exception as e:
-            logger.warning(f"Error retrieving assignments for {scope.name}: {e}")
-        
-        return assignments_data
-    
-    def get_role_definition(self, role_def_id: str) -> Optional[str]:
-        """Get role definition name with caching."""
-        if role_def_id in self._role_definition_cache:
-            return self._role_definition_cache[role_def_id]
-        
-        try:
-            url = f"{ARAConfig.AZURE_MANAGEMENT_URL}{role_def_id}?api-version={ARAConfig.AUTH_API_VERSION}"
-            data = self.api_client.get(url)
-            role_name = data.get('properties', {}).get('roleName', 'Unknown')
-            self._role_definition_cache[role_def_id] = role_name
-            return role_name
-        except Exception as e:
-            logger.debug(f"Could not fetch role definition: {e}")
-            return "Unknown"
+class DepthFilter:
+    """Decides whether a scope falls within the scan depth and resource type filter."""
+    _LEVEL = {'Management Group': 0, 'Subscription': 1, 'Resource Group': 2, 'Resource': 3}
+    _MAX_LEVEL = {ARAConfig.DEPTH_MANAGEMENT_GROUPS: 0, ARAConfig.DEPTH_SUBSCRIPTIONS: 1,
+                  ARAConfig.DEPTH_RESOURCE_GROUPS: 2, ARAConfig.DEPTH_RESOURCES: 3}
+
+    @staticmethod
+    def keep(scope: Scope, depth: str, resource_types: Optional[List[str]]) -> bool:
+        if DepthFilter._LEVEL[scope.scope_type] > DepthFilter._MAX_LEVEL[depth]:
+            return False
+        if scope.scope_type == 'Resource' and resource_types:
+            return scope.resource_type.lower() in [t.lower() for t in resource_types]
+        return True
 
 
 class PIMClient:
@@ -1078,99 +1021,6 @@ class PIMClient:
             True if PIM is available, False if unavailable, None if not yet determined
         """
         return self._pim_available
-
-
-class ResourceGroupClient:
-    """Client for Azure Resource Group operations."""
-    
-    def __init__(self, api_client: AzureAPIClient):
-        """Initialize resource group client."""
-        self.api_client = api_client
-        self._resource_group_cache = {}
-    
-    @functools.lru_cache(maxsize=ARAConfig.CACHE_SIZE_LIMIT)
-    def list_resource_groups(self, subscription_id: str) -> List[Scope]:
-        """List all resource groups in a subscription."""
-        if subscription_id in self._resource_group_cache:
-            return self._resource_group_cache[subscription_id]
-        
-        resource_groups = []
-        try:
-            url = (f"{ARAConfig.AZURE_MANAGEMENT_URL}/subscriptions/{subscription_id}/"
-                   f"resourcegroups?api-version={ARAConfig.RESOURCE_API_VERSION}")
-            
-            data = self.api_client.get(url)
-            
-            for rg in data.get('value', []):
-                rg_name = rg.get('name', 'Unknown')
-                rg_path = rg.get('id', f"/subscriptions/{subscription_id}/resourceGroups/{rg_name}")
-                
-                scope = Scope(
-                    scope_path=rg_path,
-                    name=rg_name,
-                    scope_type='Resource Group'
-                )
-                resource_groups.append(scope)
-            
-            self._resource_group_cache[subscription_id] = resource_groups
-            logger.debug(f"Found {len(resource_groups)} resource groups in subscription {subscription_id}")
-            
-        except Exception as e:
-            logger.warning(f"Error listing resource groups for subscription {subscription_id}: {e}")
-        
-        return resource_groups
-
-
-class ResourceClient:
-    """Client for Azure Resource operations."""
-    
-    def __init__(self, api_client: AzureAPIClient):
-        """Initialize resource client."""
-        self.api_client = api_client
-        self._resource_cache = {}
-    
-    def list_resources(self, subscription_id: str, resource_group_name: str, 
-                       resource_type_filter: Optional[List[str]] = None) -> List[Scope]:
-        """List all resources in a resource group with optional type filtering."""
-        cache_key = f"{subscription_id}/{resource_group_name}"
-        if cache_key in self._resource_cache:
-            cached_resources = self._resource_cache[cache_key]
-            if resource_type_filter:
-                return [r for r in cached_resources if r.resource_type in resource_type_filter]
-            return cached_resources
-        
-        resources = []
-        try:
-            url = (f"{ARAConfig.AZURE_MANAGEMENT_URL}/subscriptions/{subscription_id}/"
-                   f"resourceGroups/{resource_group_name}/resources"
-                   f"?api-version={ARAConfig.RESOURCE_API_VERSION}")
-            
-            data = self.api_client.get(url)
-            
-            for resource in data.get('value', []):
-                resource_name = resource.get('name', 'Unknown')
-                resource_id = resource.get('id', '')
-                resource_type = resource.get('type', 'Unknown')
-                
-                scope = Scope(
-                    scope_path=resource_id,
-                    name=resource_name,
-                    scope_type='Resource',
-                    resource_type=resource_type
-                )
-                resources.append(scope)
-            
-            self._resource_cache[cache_key] = resources
-            logger.debug(f"Found {len(resources)} resources in {resource_group_name}")
-            
-        except Exception as e:
-            logger.warning(f"Error listing resources for {resource_group_name}: {e}")
-        
-        # Apply filter if specified
-        if resource_type_filter:
-            resources = [r for r in resources if r.resource_type in resource_type_filter]
-        
-        return resources
 
 
 class GraphAPIClient:
@@ -1470,8 +1320,8 @@ class ARAApplication:
             api_client.get(api_client.url("/subscriptions"), {"api-version": ARAConfig.AZURE_API_VERSION})
             
             # Initialize basic clients
-            mg_client = ManagementGroupClient(api_client)
-            ra_client = RoleAssignmentClient(api_client)
+            hierarchy = HierarchyClient(api_client)
+            ra_client = AssignmentCollector(api_client)
             pim_client = PIMClient(api_client)  # PIM eligible and time-bound assignments
             graph_client = GraphAPIClient()  # Gets its own Graph token
             
@@ -1543,11 +1393,6 @@ class ARAApplication:
                         f"or omit --depth to scan only the subscription itself."
                     )
             
-            # Initialize depth-dependent clients (after depth may have been auto-adjusted)
-            sub_client = SubscriptionClient(api_client)
-            rg_client = ResourceGroupClient(api_client) if args.depth in [ARAConfig.DEPTH_RESOURCE_GROUPS, ARAConfig.DEPTH_RESOURCES] else None
-            res_client = ResourceClient(api_client) if args.depth == ARAConfig.DEPTH_RESOURCES else None
-            
             # Initialize assignment filter
             assignment_filter = AssignmentFilter(args)
             if assignment_filter.has_filters():
@@ -1558,13 +1403,14 @@ class ARAApplication:
             
             # Get scopes to scan based on scope type
             if scope_type == 'ManagementGroup':
-                mg_id = mg_client.get_management_group_id_from_scope(scope)
+                mg_id = scope.rstrip('/').split('/')[-1]
                 logger.info(f"📂 Management Group ID: {mg_id}")
                 logger.info(f"🎯 Scan Depth: {args.depth}")
                 
                 # Get all scopes in hierarchy
                 logger.info("\n🔍 Discovering child management groups and subscriptions...")
-                all_scopes = mg_client.get_management_group_hierarchy(mg_id)
+                mgs, subs = hierarchy.management_group_tree(mg_id)
+                all_scopes = mgs + subs
                 logger.info(f"✅ Found {len(all_scopes)} scope(s) to process\n")
                 
                 # Scan each scope for role assignments
@@ -1577,7 +1423,7 @@ class ARAApplication:
                 subscription_id = scope.split('/')[-1]
                 
                 # Get subscription display name
-                subscription_name = sub_client.get_subscription_display_name(subscription_id)
+                subscription_name = hierarchy.subscription(subscription_id).name
                 
                 logger.info(f"📂 Subscription: {subscription_name}")
                 logger.info(f"   ID: {subscription_id}")
@@ -1600,8 +1446,6 @@ class ARAApplication:
                     filters_applied=assignment_filter.get_summary()
                 )
             
-            resource_count = 0
-            
             # Initialize progress tracker
             # Disable progress if debug mode is on or if explicitly disabled
             show_progress = not (args.debug or args.no_progress)
@@ -1619,47 +1463,6 @@ class ARAApplication:
                     
                     # Get direct assignments for current scope
                     self._scan_scope_assignments(scope, results, ra_client, pim_client, graph_client, indent, assignment_filter, args)
-                    
-                    # If this is a subscription and we want deeper scanning
-                    if scope.scope_type == 'Subscription' and args.depth in [ARAConfig.DEPTH_RESOURCE_GROUPS, ARAConfig.DEPTH_RESOURCES]:
-                        subscription_id = scope.scope_path.split('/')[-1]
-                        
-                        # Get resource groups
-                        logger.info(f"{indent}  📦 Listing resource groups...")
-                        resource_groups = rg_client.list_resource_groups(subscription_id)
-                        logger.info(f"{indent}  ✅ Found {len(resource_groups)} resource group(s)")
-                        
-                        for rg in resource_groups:
-                            if resource_count >= args.max_resources:
-                                logger.warning(f"{indent}    ⚠️  Reached max resource limit ({args.max_resources}). Stopping resource scan.")
-                                break
-                            
-                            results.add_scanned_scope(rg)
-                            rg_indent = indent + "    "
-                            logger.info(f"{rg_indent}🔍 Scanning: {rg.name} (Resource Group)")
-                            
-                            # Scan resource group assignments
-                            self._scan_scope_assignments(rg, results, ra_client, pim_client, graph_client, rg_indent, assignment_filter, args)
-                            
-                            # If we want individual resources
-                            if args.depth == ARAConfig.DEPTH_RESOURCES:
-                                rg_name = rg.name
-                                logger.info(f"{rg_indent}  📦 Listing resources...")
-                                resources = res_client.list_resources(subscription_id, rg_name, args.resource_types)
-                                logger.info(f"{rg_indent}  ✅ Found {len(resources)} resource(s)")
-                                
-                                for resource in resources:
-                                    if resource_count >= args.max_resources:
-                                        logger.warning(f"{rg_indent}    ⚠️  Reached max resource limit ({args.max_resources}). Stopping.")
-                                        break
-                                    
-                                    results.add_scanned_scope(resource)
-                                    res_indent = rg_indent + "      "
-                                    logger.info(f"{res_indent}🔍 {resource.name} ({resource.resource_type})")
-                                    
-                                    # Scan individual resource assignments
-                                    self._scan_scope_assignments(resource, results, ra_client, pim_client, graph_client, res_indent, assignment_filter, args)
-                                    resource_count += 1
                     
                     # Update progress after processing each scope
                     progress.update(1)
@@ -1693,7 +1496,7 @@ class ARAApplication:
             return ARAConfig.EXIT_CODE_ERROR
     
     def _scan_scope_assignments(self, scope: Scope, results: ScanResult, 
-                                ra_client: RoleAssignmentClient,
+                                ra_client: AssignmentCollector,
                                 pim_client: PIMClient,
                                 graph_client: GraphAPIClient, 
                                 indent: str,
@@ -1704,7 +1507,7 @@ class ARAApplication:
         Args:
             scope: Scope to scan
             results: Results object to add assignments to
-            ra_client: Role assignment client (standard RBAC)
+            ra_client: Assignment collector (standard RBAC and role names)
             pim_client: PIM client (eligible and time-bound assignments)
             graph_client: Graph API client
             indent: Logging indentation
@@ -1725,6 +1528,8 @@ class ARAApplication:
         
         # Track assignments by unique key (principal_id + role_id + scope) to avoid duplicates
         seen_assignments = set()
+        role_names = ra_client.role_names(scope.scope_path)
+        role_name_of = lambda role_def_id: role_names.get(role_def_id.rsplit('/', 1)[-1].lower(), 'Unknown')
         
         if not skip_pim and pim_supported_scope:
             # Try to fetch PIM data (eligible and time-bound active assignments)
@@ -1751,7 +1556,7 @@ class ARAApplication:
                     assignment_type = "Eligible time-bound" if end_date else "Eligible permanent"
                     
                     # Get role name
-                    role_name = ra_client.get_role_definition(role_def_id)
+                    role_name = role_name_of(role_def_id)
                     
                     # Get principal name
                     try:
@@ -1805,7 +1610,7 @@ class ARAApplication:
                     seen_assignments.add(assignment_key)
                     
                     # Get role name
-                    role_name = ra_client.get_role_definition(role_def_id)
+                    role_name = role_name_of(role_def_id)
                     
                     # Get principal name
                     try:
@@ -1845,7 +1650,9 @@ class ARAApplication:
                 logger.debug(f"PIM time-bound active assignments API error details: {e}", exc_info=True)
         
         # Fetch standard permanent active role assignments
-        assignments_data = ra_client.get_direct_assignments_for_scope(scope)
+        rows = (ra_client.for_management_group(scope) if scope.scope_type == 'Management Group'
+                else ra_client.for_subscription(scope))
+        assignments_data = [r for r in rows if r.get('properties', {}).get('scope', '').lower() == scope.scope_path.lower()]
         
         for assignment_data in assignments_data:
             props = assignment_data.get('properties', {})
@@ -1861,7 +1668,7 @@ class ARAApplication:
             seen_assignments.add(assignment_key)
             
             # Get role name
-            role_name = ra_client.get_role_definition(role_def_id)
+            role_name = role_name_of(role_def_id)
             
             # Get principal name
             try:

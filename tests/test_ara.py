@@ -1,4 +1,4 @@
-import importlib.machinery, importlib.util, io, json, pathlib, socket, sys, unittest, urllib.error
+import importlib.machinery, importlib.util, io, json, pathlib, socket, sys, unittest, urllib.error, urllib.parse
 sys.dont_write_bytecode = True
 _path = str(pathlib.Path(__file__).resolve().parent.parent / "ara")
 _loader = importlib.machinery.SourceFileLoader("ara", _path)
@@ -108,6 +108,78 @@ class HttpClientTest(unittest.TestCase):
     def test_post_sends_json_body(self):
         c = self.client([{"value": []}]); c.request("POST", "https://x", body={"ids": ["a"]})
         self.assertEqual(json.loads(self.opener.requests[0].data), {"ids": ["a"]})
+
+class FakeAPI:
+    """Stands in for AzureAPIClient: maps a URL substring to rows (get_all) or a dict (get); records each call."""
+    def __init__(self, routes):
+        self.routes = routes; self.calls = []
+    def url(self, path):
+        return "https://m" + path
+    def get(self, url, params=None):
+        self.calls.append(url + "?" + urllib.parse.urlencode(params or {}))
+        for key, value in self.routes.items():
+            if key in url:
+                return value
+        raise ara.APIError("no route for " + url, 404)
+    get_all = get
+
+def row(scope, principal="p1", role_guid="acdd72a7-3385-48ef-bd42-f606fba81ae7", id_=None):
+    """An ARM role assignment as the roleAssignments list returns it."""
+    id_ = id_ or scope.rstrip("/") + "/providers/Microsoft.Authorization/roleAssignments/" + principal + "-" + role_guid
+    return {"id": id_, "name": id_.rsplit("/", 1)[-1], "type": "Microsoft.Authorization/roleAssignments",
+            "properties": {"scope": scope, "principalId": principal, "principalType": "User",
+                           "roleDefinitionId": "/providers/Microsoft.Authorization/roleDefinitions/" + role_guid}}
+
+class AssignmentCollectorTest(unittest.TestCase):
+    S = "/subscriptions/" + G
+    def test_subscription_keeps_inside_rows_only_and_ignores_case(self):
+        rows = [row(self.S), row(self.S + "/resourceGroups/rg-a"),
+                row(self.S.upper() + "/RESOURCEGROUPS/rg-a/providers/Microsoft.Network/virtualNetworks/v/subnets/s"),
+                row(MG), row("/"), row("/subscriptions/" + G + "0")]
+        api = FakeAPI({"roleAssignments": rows})
+        kept = ara.AssignmentCollector(api).for_subscription(ara.Scope.from_path(self.S))
+        self.assertEqual(len(kept), 3)
+        self.assertNotIn("atScope", api.calls[0])
+    def test_management_group_keeps_own_rows_and_filters_at_scope(self):
+        api = FakeAPI({"roleAssignments": [row(MG), row(MG.lower()), row("/"), row(MG + "-parent")]})
+        kept = ara.AssignmentCollector(api).for_management_group(ara.Scope.from_path(MG))
+        self.assertEqual(len(kept), 2); self.assertIn("atScope", api.calls[0])
+    def test_role_names_keyed_by_lowercased_guid(self):
+        api = FakeAPI({"roleDefinitions": [{"id": self.S + "/providers/Microsoft.Authorization/roleDefinitions/ACDD72A7-3385-48EF-BD42-F606FBA81AE7",
+                                            "properties": {"roleName": "Reader"}}]})
+        self.assertEqual(ara.AssignmentCollector(api).role_names(self.S),
+                         {"acdd72a7-3385-48ef-bd42-f606fba81ae7": "Reader"})
+
+class HierarchyClientTest(unittest.TestCase):
+    def test_tree_flattens_groups_and_subscriptions(self):
+        tree = {"name": "root", "properties": {"displayName": "Root", "children": [
+            {"type": "/subscriptions", "name": G, "displayName": "Prod"},
+            {"type": "Microsoft.Management/managementGroups", "name": "child", "displayName": "Child",
+             "children": [{"type": "/subscriptions", "name": G[:-1] + "6", "displayName": "Dev"}]}]}}
+        mgs, subs = ara.HierarchyClient(FakeAPI({"managementGroups/root": tree})).management_group_tree("root")
+        self.assertEqual([m.name for m in mgs], ["Root", "Child"])
+        self.assertEqual([(s.name, s.subscription_id) for s in subs], [("Prod", G), ("Dev", G[:-1] + "6")])
+    def test_tree_without_children(self):
+        mgs, subs = ara.HierarchyClient(FakeAPI({"managementGroups/root": {"name": "root", "properties": {"displayName": "Root", "children": None}}})).management_group_tree("root")
+        self.assertEqual((len(mgs), subs), (1, []))
+
+class DepthFilterTest(unittest.TestCase):
+    def test_depths(self):
+        S = "/subscriptions/" + G
+        paths = {"mg": MG, "sub": S, "rg": S + "/resourceGroups/rg", "res": S + "/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm"}
+        expect = {"management-groups": {"mg"}, "subscriptions": {"mg", "sub"},
+                  "resource-groups": {"mg", "sub", "rg"}, "resources": {"mg", "sub", "rg", "res"}}
+        for depth, kept in expect.items():
+            got = {k for k, p in paths.items() if ara.DepthFilter.keep(ara.Scope.from_path(p), depth, None)}
+            self.assertEqual(got, kept, depth)
+    def test_resource_types_filter_resources_only_and_ignore_case(self):
+        S = "/subscriptions/" + G + "/resourceGroups/rg"
+        vm = ara.Scope.from_path(S + "/providers/Microsoft.Compute/virtualMachines/vm")
+        sa = ara.Scope.from_path(S + "/providers/Microsoft.Storage/storageAccounts/sa")
+        types = ["microsoft.compute/virtualmachines"]
+        self.assertTrue(ara.DepthFilter.keep(vm, "resources", types))
+        self.assertFalse(ara.DepthFilter.keep(sa, "resources", types))
+        self.assertTrue(ara.DepthFilter.keep(ara.Scope.from_path(S), "resources", types))
 
 if __name__ == "__main__":
     unittest.main()
