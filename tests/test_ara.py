@@ -7,6 +7,7 @@ ara = importlib.util.module_from_spec(_spec)
 sys.modules["ara"] = ara
 _loader.exec_module(ara)
 ara.logger.disabled = True  # keep retry warnings out of test output
+from unittest import mock
 
 G = "11111111-2222-3333-4444-555555555555"
 MG = "/providers/Microsoft.Management/managementGroups/my-mg"
@@ -438,6 +439,79 @@ class ConsoleSummaryTest(unittest.TestCase):
         out = buf.getvalue()
         self.assertLess(out.index("Owner"), out.index("Reader"))
         for needle in ("PIM", "/subscriptions/x", "/tmp/r.html"): self.assertIn(needle, out)
+
+class FakeScanner:
+    """Stands in for Scanner: resolve returns the ref unchanged; scan returns the result or raises root_error."""
+    def __init__(self, scan_result, root_error):
+        self.scan_result, self.root_error = scan_result, root_error
+    def resolve(self, ref): return ref
+    def scan(self, ref, depth, resource_types=None):
+        if self.root_error:
+            raise self.root_error
+        return self.scan_result
+
+def app(scan_result=None, root_error=None, graph=None):
+    return ara.ARAApplication(scanner_factory=lambda a: FakeScanner(scan_result, root_error), graph_factory=lambda: graph)
+
+def run(app, *argv):
+    with tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(io.StringIO()):
+        code = app.run(ara.parse_arguments(list(argv) + ["--token", "t", "--no-progress", "--output-dir", d]))
+        return code, sorted(os.listdir(d))
+
+class ApplicationTest(unittest.TestCase):
+    def test_complete_scan_exits_0_and_writes_json(self):
+        code, files = run(app(result([ra()])), "--scope", "my-mg")
+        self.assertEqual(code, 0); self.assertIn("role_assignments_my-mg.json", files)
+    def test_zero_assignments_is_success(self):
+        code, files = run(app(result([])), "--scope", "my-mg")
+        self.assertEqual(code, 0); self.assertIn("role_assignments_my-mg.json", files)
+    def test_failed_scope_exits_3_with_partial_file(self):
+        code, files = run(app(result([ra()], failed_scopes=[{"scope": "/x", "error": "e"}])), "--scope", "my-mg")
+        self.assertEqual(code, 3); self.assertIn("role_assignments_my-mg.partial.json", files)
+    def test_interrupt_exits_130_with_partial_file(self):
+        code, files = run(app(result([ra()], interrupted=True)), "--scope", "my-mg")
+        self.assertEqual(code, 130); self.assertTrue(any(".partial." in f for f in files))
+    def test_root_failure_exits_1_and_writes_nothing(self):
+        code, files = run(app(root_error=ara.APIError("not found", status=404)), "--scope", "my-mg")
+        self.assertEqual((code, files), (1, []))
+    def test_usage_errors_exit_2(self):
+        for argv in (("--scope", "a/b/c"), ("--scope", "my-mg", "--assignment-type-filter", "eligible"),
+                     ("--scope", "my-mg", "--resource-types", "Microsoft.Compute/virtualMachines"),
+                     ("--scope", "subscriptions/" + G, "--depth", "management-groups")):
+            self.assertEqual(run(app(result([])), *argv)[0], 2, argv)
+    def test_name_filter_without_graph_exits_1_before_scanning(self):
+        code, files = run(app(result([ra()]), graph=None), "--scope", "my-mg", "--principal-name-filter", "^a")
+        self.assertEqual((code, files), (1, []))
+    def test_csv_is_written_in_addition(self):
+        _, files = run(app(result([ra()])), "--scope", "my-mg", "--format", "csv")
+        self.assertIn("role_assignments_my-mg.csv", files); self.assertIn("role_assignments_my-mg.json", files)
+    def test_filter_is_applied_and_counted(self):
+        a = app(result([ra(), ra(role="Owner")])); code, _ = run(a, "--scope", "my-mg", "--role-filter", "Owner")
+        self.assertEqual((len(a.last_result.assignments), a.last_result.assignments_before_filters), (1, 2))
+    def test_unwritable_output_dir_exits_1(self):
+        with tempfile.NamedTemporaryFile() as f:
+            code = app(result([ra()])).run(ara.parse_arguments(["--scope", "my-mg", "--token", "t", "--no-progress", "--output-dir", os.path.join(f.name, "x")]))
+        self.assertEqual(code, 1)
+    def test_failed_write_removes_tmp_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(ara.os, "replace", side_effect=OSError("disk full")), self.assertRaises(ara.ExportError):
+                ara.JSONOutputHandler(d).generate(result([]))
+            self.assertEqual(os.listdir(d), [])
+
+class ArgumentsTest(unittest.TestCase):
+    def test_removed_flags_are_rejected(self):
+        for flag in (["--max-resources", "5"], ["--exclude-system"]):
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()): ara.parse_arguments(["--scope", "x"] + flag)
+    def test_depth_default_is_none(self):
+        self.assertIsNone(ara.parse_arguments(["--scope", "x"]).depth)
+
+class AuthTest(unittest.TestCase):
+    def test_no_prompt_without_terminal(self):
+        with mock.patch.object(sys.stdin, "isatty", return_value=False), mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch("shutil.which", return_value=None):
+            with self.assertRaises(ara.AuthenticationError): ara.AzureAuthenticationManager().get_token()
+    def test_keychain_provider_is_gone(self):
+        self.assertFalse(hasattr(ara, "KeychainAuthProvider"))
 
 if __name__ == "__main__":
     unittest.main()

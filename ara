@@ -10,7 +10,7 @@ multiple output formats.
 Features:
 - PIM (Privileged Identity Management) integration - distinguish between active 
   permanent, active time-bound, eligible permanent, and eligible time-bound assignments
-- Multiple authentication methods (environment, Azure CLI, keychain, interactive)
+- Multiple authentication methods (token argument, environment, Azure CLI, interactive)
 - Hierarchical management group scanning
 - Principal name resolution via Microsoft Graph API
 - JSON and CSV output formats
@@ -27,20 +27,18 @@ Requirements:
 
 Author: fjdev
 License: MIT
-Version: 2.1.0
+Version: 3.0.0
 """
 
 # Standard library imports
 import argparse
-import asyncio
-import base64
 import csv
 import io
 import json
 import logging
 import os
 import re
-import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -59,6 +57,9 @@ __author__ = "fjdev"
 
 class ARAConfig:
     """Configuration constants for ARA."""
+    DESCRIPTOR = "the role atlas for Azure"
+    SLOGAN = "See who holds the keys."
+
     # API Endpoints
     AZURE_MANAGEMENT_URL = "https://management.azure.com"
     GRAPH_API_URL = "https://graph.microsoft.com/v1.0"
@@ -73,19 +74,9 @@ class ARAConfig:
     API_REQUEST_TIMEOUT = 30  # seconds
     TOKEN_VALIDATION_TIMEOUT = 10  # seconds
     
-    # Performance
-    MAX_CONCURRENT_REQUESTS = 5
-    CACHE_SIZE_LIMIT = 1000
-    
     # File Handling
     RESULTS_DIR = "results"
     JSON_INDENT = 2
-    CSV_ENCODING = "utf-8"
-    
-    # Authentication
-    KEYCHAIN_SERVICE = 'azure-role-assignment-exporter'
-    KEYCHAIN_ACCOUNT = 'azure-credentials'
-    KEYCHAIN_UPDATE_FLAG = '-U'
     
     # Environment variables
     TOKEN_ENV_VARS = [
@@ -93,20 +84,17 @@ class ARAConfig:
     ]
     
     # HTTP status codes
-    HTTP_OK = 200
     HTTP_UNAUTHORIZED = 401
     HTTP_FORBIDDEN = 403
     HTTP_NOT_FOUND = 404
     HTTP_RATE_LIMITED = 429
     HTTP_SERVER_ERROR = 500
     
-    # Output formatting
-    SEPARATOR_LENGTH = 80
-    SUBSECTION_SEPARATOR_LENGTH = 60
-    
     # Exit codes
     EXIT_CODE_SUCCESS = 0
     EXIT_CODE_ERROR = 1
+    EXIT_CODE_USAGE = 2
+    EXIT_CODE_INCOMPLETE = 3
     EXIT_CODE_INTERRUPT = 130
     
     ASSIGNMENT_TYPES = ("Active permanent", "Active time-bound", "Eligible permanent", "Eligible time-bound", "Active")
@@ -117,32 +105,15 @@ class ARAConfig:
     DEPTH_SUBSCRIPTIONS = 'subscriptions'
     DEPTH_RESOURCE_GROUPS = 'resource-groups'
     DEPTH_RESOURCES = 'resources'
-    DEFAULT_DEPTH = DEPTH_MANAGEMENT_GROUPS
     
     # Resource scanning limits
-    DEFAULT_MAX_RESOURCES = 10000
     DEFAULT_API_DELAY = 0.1  # seconds between API calls
     MAX_ATTEMPTS = 4
     RETRY_WAITS = (2, 4, 8)  # seconds before retry 1, 2, 3 unless Retry-After says otherwise
     
-    # Resource API version
-    RESOURCE_API_VERSION = "2021-04-01"
-    
     # Logging
     DEFAULT_LOG_FORMAT = '%(asctime)s - %(levelname)s - %(message)s'
     DEFAULT_DATE_FORMAT = '%H:%M:%S'
-
-
-def safe_print(*args, **kwargs):
-    """Print function that handles BrokenPipeError gracefully."""
-    try:
-        print(*args, **kwargs)
-    except BrokenPipeError:
-        try:
-            sys.stdout.close()
-        except OSError:
-            pass
-        sys.exit(0)
 
 
 # Configure logging
@@ -634,12 +605,14 @@ class EnvironmentAuthProvider(AuthenticationProvider):
 class AzureCliAuthProvider(AuthenticationProvider):
     """Get token from Azure CLI."""
     
-    def get_token(self) -> Optional[str]:
-        """Get token from Azure CLI."""
+    def get_token(self, resource: str = ARAConfig.AZURE_MANAGEMENT_URL) -> Optional[str]:
+        """Get a token for `resource` from Azure CLI; None when az is not installed or not logged in."""
+        az = shutil.which('az')
+        if not az:
+            return None
         try:
-            import subprocess
             result = subprocess.run(
-                ['az', 'account', 'get-access-token', '--resource', ARAConfig.AZURE_MANAGEMENT_URL],
+                [az, 'account', 'get-access-token', '--resource', resource],
                 capture_output=True,
                 text=True,
                 check=True,
@@ -651,10 +624,8 @@ class AzureCliAuthProvider(AuthenticationProvider):
             if token:
                 logger.debug("Retrieved token from Azure CLI")
                 return token
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
             logger.debug("Could not retrieve token from Azure CLI")
-        except Exception as e:
-            logger.debug(f"Azure CLI access failed: {e}")
         return None
     
     def get_name(self) -> str:
@@ -662,88 +633,31 @@ class AzureCliAuthProvider(AuthenticationProvider):
         return "Azure CLI"
 
 
-class KeychainAuthProvider(AuthenticationProvider):
-    """Get token from macOS Keychain."""
-    
-    def get_token(self) -> Optional[str]:
-        """Get token from macOS Keychain."""
-        try:
-            import subprocess
-            result = subprocess.run(
-                ['security', 'find-generic-password', '-s', ARAConfig.KEYCHAIN_SERVICE, 
-                 '-a', ARAConfig.KEYCHAIN_ACCOUNT, '-w'],
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=ARAConfig.TOKEN_VALIDATION_TIMEOUT
-            )
-            
-            token = result.stdout.strip()
-            if token:
-                logger.debug(f"Found token in keychain: {ARAConfig.KEYCHAIN_SERVICE}")
-                return token
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
-            logger.debug(f"Could not retrieve token from keychain")
-        except Exception as e:
-            logger.debug(f"Keychain access failed: {e}")
-        return None
-    
-    def get_name(self) -> str:
-        """Get provider name."""
-        return "macOS Keychain"
-
-
 class InteractiveAuthProvider(AuthenticationProvider):
     """Get token through interactive prompt."""
     
     def get_token(self) -> Optional[str]:
-        """Prompt user for token securely."""
-        safe_print("\n🔐 Azure authentication required.")
-        safe_print("   Please provide an Azure access token with permissions to read:")
-        safe_print("   • Role assignments")
-        safe_print("   • Management groups")
-        safe_print("   • Microsoft Graph (for principal name resolution)")
-        safe_print()
-        safe_print("   You can get a token via:")
-        safe_print("   • az account get-access-token --resource https://management.azure.com")
-        safe_print("   • Azure Portal > Cloud Shell > az account get-access-token")
-        safe_print()
+        """Prompt for a token; only when stdin is a terminal."""
+        if not sys.stdin.isatty():
+            return None
+        print("Azure authentication required. Provide an access token that can read")
+        print("role assignments and management groups. To get one, run:")
+        print("  az account get-access-token --resource https://management.azure.com")
+        print()
         
         try:
             import getpass
-            token = getpass.getpass("Enter your Azure access token: ").strip()
+            token = getpass.getpass("Azure access token: ").strip()
             if not token:
                 logger.warning("No token provided")
                 return None
-            
-            # Offer to save to keychain on macOS
-            if sys.platform == 'darwin':
-                self._offer_keychain_save(token)
-            
             return token
         except KeyboardInterrupt:
-            safe_print("\n❌ Authentication cancelled by user")
+            print("\nAuthentication cancelled.")
             return None
         except Exception as e:
             logger.error(f"Error during interactive authentication: {e}")
             return None
-    
-    def _offer_keychain_save(self, token: str):
-        """Offer to save token to keychain."""
-        try:
-            response = input("\n💾 Save token to macOS Keychain for future use? (y/N): ").strip().lower()
-            if response in ['y', 'yes']:
-                import subprocess
-                subprocess.run([
-                    'security', 'add-generic-password',
-                    '-s', ARAConfig.KEYCHAIN_SERVICE,
-                    '-a', ARAConfig.KEYCHAIN_ACCOUNT,
-                    '-w', token,
-                    ARAConfig.KEYCHAIN_UPDATE_FLAG
-                ], capture_output=True, check=True)
-                safe_print("✅ Token saved to keychain")
-        except Exception as e:
-            logger.debug(f"Could not save to keychain: {e}")
     
     def get_name(self) -> str:
         """Get provider name."""
@@ -751,18 +665,11 @@ class InteractiveAuthProvider(AuthenticationProvider):
 
 
 class AzureAuthenticationManager:
-    """Manages Azure authentication with multiple providers."""
+    """Finds a token: --token, environment variables, Azure CLI, then an interactive prompt."""
     
-    def __init__(self, allow_interactive: bool = True):
-        """Initialize authentication manager."""
-        self.providers = [
-            EnvironmentAuthProvider(),
-            AzureCliAuthProvider(),
-            KeychainAuthProvider(),
-        ]
-        
-        if allow_interactive:
-            self.providers.append(InteractiveAuthProvider())
+    def __init__(self):
+        self.providers = [EnvironmentAuthProvider(), AzureCliAuthProvider(), InteractiveAuthProvider()]
+        self.source = None  # type: Optional[AuthenticationProvider]
     
     def get_token(self, override_token: Optional[str] = None) -> str:
         """Get Azure access token using various methods."""
@@ -770,39 +677,20 @@ class AzureAuthenticationManager:
             logger.info("Using provided token")
             return override_token
         
-        logger.info("🔍 Looking for Azure authentication...")
+        logger.info("Looking for Azure authentication...")
         
         for provider in self.providers:
-            try:
-                token = provider.get_token()
-                if token:
-                    if self._validate_token(token):
-                        logger.info(f"✅ Authenticated via {provider.get_name()}")
-                        return token
-                    else:
-                        logger.warning(f"❌ Invalid token from {provider.get_name()}")
-            except Exception as e:
-                logger.debug(f"Provider {provider.get_name()} failed: {e}")
+            token = provider.get_token()
+            if token:
+                logger.info(f"Authenticated via {provider.get_name()}")
+                self.source = provider
+                return token
         
-        raise AuthenticationError("No valid authentication token found")
+        raise AuthenticationError("No Azure token found. Pass --token, set AZURE_ACCESS_TOKEN, or run az login.")
     
-    def _validate_token(self, token: str) -> bool:
-        """Validate token by making a test API call."""
-        try:
-            url = f"{ARAConfig.AZURE_MANAGEMENT_URL}/subscriptions?api-version={ARAConfig.AZURE_API_VERSION}"
-            headers = {'Authorization': f'Bearer {token}'}
-            
-            request = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(request, timeout=ARAConfig.TOKEN_VALIDATION_TIMEOUT) as response:
-                if response.status == ARAConfig.HTTP_OK:
-                    data = json.loads(response.read().decode())
-                    sub_count = len(data.get('value', []))
-                    logger.debug(f"Token validation successful - found {sub_count} subscriptions")
-                    return True
-            return False
-        except Exception as e:
-            logger.debug(f"Token validation failed: {e}")
-            return False
+    def refresher(self) -> Optional[Callable[[], Optional[str]]]:
+        """The Azure CLI token getter when the token came from az, otherwise None."""
+        return self.source.get_token if isinstance(self.source, AzureCliAuthProvider) else None
 
 
 # API Clients
@@ -1189,12 +1077,17 @@ class OutputHandler(ABC):
 
     def generate(self, results: ScanResult) -> str:
         path = os.path.join(self.output_dir, self.file_name(results))
+        text = self.render(results)
         try:
             os.makedirs(self.output_dir, exist_ok=True)
             with open(path + ".tmp", 'w', encoding='utf-8', newline='') as f:
-                f.write(self.render(results))
+                f.write(text)
             os.replace(path + ".tmp", path)
         except OSError as e:
+            try:
+                os.remove(path + ".tmp")
+            except OSError:
+                pass
             raise ExportError(f"Failed to write {path}: {e}")
         return path
 
@@ -1203,7 +1096,7 @@ class JSONOutputHandler(OutputHandler):
     extension = "json"
 
     def render(self, results: ScanResult) -> str:
-        return json.dumps(results.to_dict(), indent=ARAConfig.JSON_INDENT)
+        return json.dumps(results.to_dict(), indent=ARAConfig.JSON_INDENT, ensure_ascii=False)
 
 
 class CSVOutputHandler(OutputHandler):
@@ -1233,138 +1126,140 @@ class ConsoleSummary:
     """Prints the scan outcome: counts, roles, gaps and written files."""
 
     def print(self, results: ScanResult, paths: List[str]) -> None:
-        safe_print(f"Found {len(results.assignments)} role assignments in "
+        print(f"Found {len(results.assignments)} role assignments in "
                    f"{results.management_groups_scanned} management groups and "
                    f"{results.subscriptions_scanned} subscriptions.")
         roles = Counter(a.role_name for a in results.assignments)
         for role, count in sorted(roles.items(), key=lambda kv: (-kv[1], kv[0])):
-            safe_print(f"  {count:>6}  {role}")
+            print(f"  {count:>6}  {role}")
         if results.pim_status != "included":
-            safe_print(f"PIM: {results.pim_status}")
+            print(f"PIM: {results.pim_status}")
         if results.names != "resolved":
-            safe_print(f"Names: {results.names}")
+            print(f"Names: {results.names}")
         for failed in results.failed_scopes:
-            safe_print(f"Failed scope: {failed['scope']}: {failed['error']}")
+            print(f"Failed scope: {failed['scope']}: {failed['error']}")
         for path in paths:
-            safe_print(f"Written: {path}")
+            print(f"Written: {path}")
 
 
 # Main Application
 class ARAApplication:
-    """Main ARA application class."""
-    
-    def __init__(self, results_dir: str = ARAConfig.RESULTS_DIR):
-        """Initialize ARA application."""
-        self.results_dir = results_dir
-        self.output_handlers = {
-            'summary': ConsoleSummary(),
-            'json': JSONOutputHandler(results_dir),
-            'csv': CSVOutputHandler(results_dir),
-        }
-    
+    """Parses the scope, scans, resolves names, filters and writes the outputs."""
+
+    def __init__(self, scanner_factory: Optional[Callable] = None, graph_factory: Optional[Callable] = None):
+        self.auth = AzureAuthenticationManager()
+        self.token = None  # type: Optional[str]
+        self.scanner_factory = scanner_factory or self._scanner
+        self.graph_factory = graph_factory or (lambda: GraphAPIClient.create(
+            lambda: AzureCliAuthProvider().get_token("https://graph.microsoft.com")))
+        self.last_result = None  # type: Optional[ScanResult]
+
+    def _scanner(self, args: argparse.Namespace) -> Scanner:
+        api = AzureAPIClient(self.token, args.api_delay, refresh_token=self.auth.refresher())
+        return Scanner(HierarchyClient(api), AssignmentCollector(api),
+                       None if args.skip_pim else PIMCollector(api),
+                       show_progress=not (args.no_progress or args.debug))
+
+    def handlers(self, args: argparse.Namespace) -> List[OutputHandler]:
+        handlers = [JSONOutputHandler(args.output_dir)]  # type: List[OutputHandler]
+        if args.format == "csv":
+            handlers.append(CSVOutputHandler(args.output_dir))
+        return handlers
+
     def run(self, args: argparse.Namespace) -> int:
-        """Run the ARA application."""
+        """Run one scan and return the exit code."""
         try:
-            # Get authentication token
-            auth_manager = AzureAuthenticationManager(allow_interactive=True)
-            token = auth_manager.get_token(args.token)
-            
-            # Initialize API clients with rate limiting
-            api_client = AzureAPIClient(token, api_delay=args.api_delay)
+            ref = ScopeParser.parse(args.scope)
             assignment_filter = AssignmentFilter(args)
-            # shortcut: interim wiring so the CLI still scans; Task 8 rewrites run()
-            scanner = Scanner(HierarchyClient(api_client), AssignmentCollector(api_client),
-                              None if args.skip_pim else PIMCollector(api_client),
-                              show_progress=not (args.debug or args.no_progress))
-            ref = scanner.resolve(ScopeParser.parse(args.scope))
+            if args.resource_types and args.depth != ARAConfig.DEPTH_RESOURCES:
+                raise ValidationError("--resource-types needs --depth resources")
+        except ValidationError as e:
+            logger.error(str(e))
+            return ARAConfig.EXIT_CODE_USAGE
+
+        try:
+            self.token = self.auth.get_token(args.token)
+        except AuthenticationError as e:
+            logger.error(str(e))
+            return ARAConfig.EXIT_CODE_ERROR
+        graph = self.graph_factory()
+        if assignment_filter.needs_graph() and graph is None:
+            logger.error("--principal-name-filter and --exclude-managed-identities need a Microsoft Graph token. "
+                         "Run az login or set AZURE_GRAPH_TOKEN.")
+            return ARAConfig.EXIT_CODE_ERROR
+
+        scanner = self.scanner_factory(args)
+        try:
+            ref = scanner.resolve(ref)
             results = scanner.scan(ref, ScopeParser.resolve_depth(ref.kind, args.depth), args.resource_types)
-            results.assignments = assignment_filter.apply(results.assignments)
+        except ValidationError as e:
+            logger.error(str(e))
+            return ARAConfig.EXIT_CODE_USAGE
+        except (APIError, AuthenticationError) as e:
+            logger.error(f"Cannot read {ref.path}: {e}")
+            return ARAConfig.EXIT_CODE_ERROR
+
+        assignments, results.names = PrincipalResolver(graph).resolve(results.assignments)
+        if assignment_filter.needs_graph() and results.names != "resolved":
+            logger.warning("Principal names are incomplete. Filters were not applied.")
+            results.assignments = assignments
+            results.filters_not_applied = True
+        else:
+            results.assignments_before_filters = len(assignments)
+            results.assignments = assignment_filter.apply(assignments)
             results.filters_applied = assignment_filter.get_summary()
+        self.last_result = results
 
-            # Generate outputs
-            paths = [self.output_handlers[args.format].generate(results)] if args.format in ('json', 'csv') else []
-            self.output_handlers['summary'].print(results, paths)
-            
-            logger.info("🎉 ARA completed successfully!")
-            return ARAConfig.EXIT_CODE_SUCCESS
-            
-        except KeyboardInterrupt:
-            logger.info("\n❌ Operation cancelled by user")
+        try:
+            paths = [handler.generate(results) for handler in self.handlers(args)]
+        except ExportError as e:
+            logger.error(str(e))
+            return ARAConfig.EXIT_CODE_ERROR
+        ConsoleSummary().print(results, paths)
+        if results.interrupted:
             return ARAConfig.EXIT_CODE_INTERRUPT
-        except (AuthenticationError, ValidationError, APIError, ExportError) as e:
-            logger.error(f"❌ Error: {e}")
-            return ARAConfig.EXIT_CODE_ERROR
-        except Exception as e:
-            logger.error(f"❌ Unexpected error: {e}")
-            if args.debug:
-                import traceback
-                traceback.print_exc()
-            return ARAConfig.EXIT_CODE_ERROR
+        return ARAConfig.EXIT_CODE_SUCCESS if results.complete else ARAConfig.EXIT_CODE_INCOMPLETE
 
 
-def parse_arguments() -> argparse.Namespace:
+def parse_arguments(argv: Optional[List[str]] = None) -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description=f"Azure Role Assignment Exporter (ARA) v{__version__} - Export Azure role assignments",
+        description=f"ARA, {ARAConfig.DESCRIPTOR}. {ARAConfig.SLOGAN}\n"
+                    f"Exports the role assignments under a management group or subscription. Version {__version__}.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Authentication Methods (tried in order):
+Authentication (tried in order):
   1. --token argument
   2. Environment variables (AZURE_ACCESS_TOKEN, AZURE_TOKEN, ARM_ACCESS_TOKEN)
   3. Azure CLI (az account get-access-token)
-  4. macOS Keychain
-  5. Interactive prompt
+  4. Interactive prompt (only in a terminal)
+  Principal names come from Microsoft Graph: AZURE_GRAPH_TOKEN, else Azure CLI.
 
 Output:
-  Files are generated in the 'results/' directory.
-  Console output shows a summary of findings.
+  A JSON file is always written to --output-dir (default: results).
+  An incomplete scan writes *.partial.* files.
+
+Exit codes:
+  0 complete, 1 error and nothing written, 2 usage error,
+  3 incomplete with files written, 130 interrupted with partial files written.
 
 Examples:
-  # Scan management group (simple format)
   ara --scope my-mg
-
-  # Scan management group (full format)
-  ara --scope /providers/Microsoft.Management/managementGroups/my-mg
-
-  # Scan subscription (GUID format)
-  ara --scope xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-
-  # Scan subscription (full format)
-  ara --scope /subscriptions/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-
-  # Include subscriptions (for MG scope)
-  ara --scope my-mg --depth subscriptions
-
-  # Scan resource groups in a subscription
-  ara --scope xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx --depth resource-groups
-
-  # Export to CSV
-  ara --scope my-mg --format csv
-
-  # Use specific token
-  ara --scope my-mg --token YOUR_TOKEN
-
-  # Debug mode
-  ara --scope my-mg --debug
+  ara --scope /providers/Microsoft.Management/managementGroups/my-mg --depth subscriptions
+  ara --scope xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx --depth resources
+  ara --scope my-mg --format csv --role-filter "Owner,User Access Administrator"
         """
     )
     
     parser.add_argument(
         '--scope',
         required=True,
-        help='Scope to scan. Management Group: "my-mg" or full path. Subscription: GUID or "/subscriptions/{guid}"'
+        help='Scope to scan. Management group: "my-mg" or full path. Subscription: GUID or "/subscriptions/{guid}"'
     )
     
     parser.add_argument(
         '--token',
         help='Azure access token (overrides auto-detection)'
-    )
-    
-    parser.add_argument(
-        '--format',
-        choices=['json', 'csv'],
-        default='json',
-        help='Output format: json or csv'
     )
     
     parser.add_argument(
@@ -1375,24 +1270,16 @@ Examples:
             ARAConfig.DEPTH_RESOURCE_GROUPS,
             ARAConfig.DEPTH_RESOURCES
         ],
-        default=ARAConfig.DEFAULT_DEPTH,
-        help=f'Scan depth level (default: {ARAConfig.DEFAULT_DEPTH}). '
-             'WARNING: resource-groups and resources can be slow for large environments'
+        default=None,
+        help=f'Lowest scope level to include (default: {ARAConfig.DEPTH_MANAGEMENT_GROUPS} for a management group, '
+             f'{ARAConfig.DEPTH_RESOURCE_GROUPS} for a subscription)'
     )
     
     parser.add_argument(
         '--resource-types',
         nargs='+',
-        help='Filter resources by type (e.g., Microsoft.Compute/virtualMachines). '
-             'Only applies when --depth is "resources"'
-    )
-    
-    parser.add_argument(
-        '--max-resources',
-        type=int,
-        default=ARAConfig.DEFAULT_MAX_RESOURCES,
-        help=f'Maximum number of resources to scan (default: {ARAConfig.DEFAULT_MAX_RESOURCES}). '
-             'Safety limit to prevent runaway scans'
+        help='Keep only resources of these types (e.g. Microsoft.Compute/virtualMachines). '
+             'Needs --depth resources'
     )
     
     parser.add_argument(
@@ -1401,6 +1288,26 @@ Examples:
         default=ARAConfig.DEFAULT_API_DELAY,
         help=f'Delay between API calls in seconds (default: {ARAConfig.DEFAULT_API_DELAY}). '
              'Increase to avoid rate limiting'
+    )
+    
+    parser.add_argument(
+        '--format',
+        choices=['csv'],
+        default=None,
+        help='Also write a CSV file next to the JSON file'
+    )
+    
+    parser.add_argument(
+        '--output-dir',
+        default=ARAConfig.RESULTS_DIR,
+        help=f'Directory for the output files (default: {ARAConfig.RESULTS_DIR})'
+    )
+    
+    parser.add_argument(
+        '--skip-pim',
+        action='store_true',
+        help='Skip PIM (Privileged Identity Management) API calls. '
+             'All assignments then get the type "Active"'
     )
     
     parser.add_argument(
@@ -1414,42 +1321,29 @@ Examples:
         '--principal-type-filter',
         type=str,
         help='Filter by principal type (comma-separated for multiple). '
-             'Valid types: User, Group, ServicePrincipal. '
+             f'Valid types: {", ".join(ARAConfig.PRINCIPAL_TYPES)}. '
              'Example: --principal-type-filter "User,Group"'
     )
     
     parser.add_argument(
         '--principal-name-filter',
         type=str,
-        help='Filter by principal name (supports regex patterns). '
-             'Example: --principal-name-filter "^Admin.*"'
-    )
-    
-    parser.add_argument(
-        '--exclude-system',
-        action='store_true',
-        help='Exclude system-assigned managed identities from results'
+        help='Filter by principal name (regex, case-insensitive). Needs a Microsoft Graph token. '
+             'Example: --principal-name-filter "^Admin"'
     )
     
     parser.add_argument(
         '--assignment-type-filter',
         type=str,
         help='Filter by assignment type (comma-separated for multiple). '
-             'Valid types: "Active permanent", "Active time-bound", "Eligible permanent", "Eligible time-bound". '
+             f'Valid types: {", ".join(ARAConfig.ASSIGNMENT_TYPES)}. '
              'Example: --assignment-type-filter "Active permanent,Eligible permanent"'
     )
     
     parser.add_argument(
-        '--skip-pim',
+        '--exclude-managed-identities',
         action='store_true',
-        help='Skip PIM (Privileged Identity Management) API calls. '
-             'Use this if PIM is not enabled or to improve performance.'
-    )
-    
-    parser.add_argument(
-        '--debug',
-        action='store_true',
-        help='Enable debug output'
+        help='Leave out managed identities. Needs a Microsoft Graph token'
     )
     
     parser.add_argument(
@@ -1459,41 +1353,30 @@ Examples:
     )
     
     parser.add_argument(
-        '--version',
-        action='version',
-        version=f'ARA v{__version__}'
+        '--debug',
+        action='store_true',
+        help='Enable debug output'
     )
     
-    return parser.parse_args()
+    parser.add_argument(
+        '--version',
+        action='version',
+        version=f'ARA {__version__}'
+    )
+    
+    return parser.parse_args(argv)
 
 
 def main() -> int:
     """Main application entry point."""
-    # Ignore SIGPIPE to prevent broken pipe errors
-    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
-    
     args = parse_arguments()
-    
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
-    
-    # Create results directory relative to script location
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    results_dir = os.path.join(script_dir, ARAConfig.RESULTS_DIR)
-    
-    app = ARAApplication(results_dir)
     try:
-        return app.run(args)
-    except BrokenPipeError:
-        try:
-            sys.stdout.close()
-        except OSError:
-            pass
-        try:
-            sys.stderr.close()
-        except OSError:
-            pass
-        return ARAConfig.EXIT_CODE_SUCCESS
+        return ARAApplication().run(args)
+    except KeyboardInterrupt:
+        logger.info("Cancelled.")
+        return ARAConfig.EXIT_CODE_INTERRUPT
 
 
 if __name__ == "__main__":
