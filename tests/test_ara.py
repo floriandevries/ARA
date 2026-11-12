@@ -333,5 +333,68 @@ class ScannerTest(unittest.TestCase):
         self.assertRegex(m["scan_timestamp"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
         for gone in ("total_scopes_scanned",): self.assertNotIn(gone, m)
 
+def ra(name="Ann", pid="p1", ptype="User", role="Reader", atype="Active permanent"):
+    return ara.RoleAssignment(principal_id=pid, principal_name=name, principal_type=ptype, role_name=role,
+                              role_id="r", scope=MG, scope_name="my-mg", scope_type="Management Group",
+                              assignment_type=atype)
+
+class FakeGraph:
+    """Stands in for GraphAPIClient: returns the known objects among the requested ids, or raises error."""
+    def __init__(self, objects, error=None):
+        self.objects, self.error = objects, error
+    def get_by_ids(self, ids):
+        if self.error:
+            raise self.error
+        return {i: self.objects[i] for i in ids if i in self.objects}
+
+def args(**kw):
+    values = dict(role_filter=None, principal_type_filter=None, assignment_type_filter=None,
+                  principal_name_filter=None, exclude_managed_identities=False)
+    values.update(kw)
+    return ara.argparse.Namespace(**values)
+
+class PrincipalResolverTest(unittest.TestCase):
+    def test_graph_fills_names_marks_unknown_and_managed_identities(self):
+        rows = [ra(name=None, pid="a"), ra(name=None, pid="b"), ra(name="sp", pid="c", ptype="ServicePrincipal"), ra(name="Kept", pid="d")]
+        graph = FakeGraph({"a": {"displayName": "Ann"}, "c": {"displayName": "id-aks", "servicePrincipalType": "ManagedIdentity"}})
+        out, status = ara.PrincipalResolver(graph).resolve(rows)
+        self.assertEqual([(a.principal_name, a.principal_type) for a in out],
+                         [("Ann", "User"), ("Unknown", "User"), ("id-aks", "ManagedIdentity"), ("Kept", "User")])
+        self.assertEqual(status, "resolved")
+    def test_empty_display_name_keeps_none(self):
+        out, _ = ara.PrincipalResolver(FakeGraph({"a": {"displayName": None}})).resolve([ra(name=None, pid="a")])
+        self.assertIsNone(out[0].principal_name)
+    def test_without_graph_status_reflects_pim_names(self):
+        r = ara.PrincipalResolver(None)
+        self.assertEqual(r.resolve([ra(), ra(pid="b")])[1], "resolved")
+        self.assertEqual(r.resolve([ra(), ra(name=None, pid="b")])[1], "partial")
+        self.assertEqual(r.resolve([ra(name=None)])[1], "unavailable")
+    def test_graph_failure_never_writes_unknown(self):
+        out, status = ara.PrincipalResolver(FakeGraph({}, error=ara.APIError("x", status=500))).resolve([ra(name=None)])
+        self.assertEqual((out[0].principal_name, status), (None, "unavailable"))
+    def test_get_by_ids_chunks_by_1000(self):
+        opener = FakeOpener([{"value": []}, {"value": []}, {"value": []}])
+        g = ara.GraphAPIClient("t", api_delay=0, opener=opener, sleep=lambda s: None)
+        g.get_by_ids([str(i) for i in range(2001)])
+        self.assertEqual([len(json.loads(r.data)["ids"]) for r in opener.requests], [1000, 1000, 1])
+
+class AssignmentFilterTest(unittest.TestCase):
+    def test_name_filter_skips_missing_names_without_crashing(self):
+        f = ara.AssignmentFilter(args(principal_name_filter="^sp-"))
+        self.assertEqual([a.principal_name for a in f.apply([ra(name=None), ra(name="sp-x"), ra(name="Ann")])], ["sp-x"])
+    def test_exclude_managed_identities(self):
+        f = ara.AssignmentFilter(args(exclude_managed_identities=True))
+        self.assertEqual(len(f.apply([ra(ptype="ManagedIdentity"), ra(ptype="ServicePrincipal")])), 1)
+        self.assertTrue(f.needs_graph())
+    def test_filters_are_case_insensitive_and_combine(self):
+        f = ara.AssignmentFilter(args(role_filter="owner,reader", assignment_type_filter="active permanent"))
+        self.assertEqual(len(f.apply([ra(), ra(role="Contributor"), ra(atype="Eligible permanent")])), 1)
+        self.assertFalse(f.needs_graph())
+    def test_unknown_values_are_rejected(self):
+        for kw in ({"assignment_type_filter": "eligible"}, {"principal_type_filter": "Robot"}):
+            with self.assertRaises(ara.ValidationError): ara.AssignmentFilter(args(**kw))
+    def test_active_is_a_valid_assignment_type(self):
+        ara.AssignmentFilter(args(assignment_type_filter="Active"))
+
 if __name__ == "__main__":
     unittest.main()

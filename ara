@@ -47,7 +47,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from abc import ABC, abstractmethod
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -108,6 +108,7 @@ class ARAConfig:
     EXIT_CODE_INTERRUPT = 130
     
     ASSIGNMENT_TYPES = ("Active permanent", "Active time-bound", "Eligible permanent", "Eligible time-bound", "Active")
+    PRINCIPAL_TYPES = ("User", "Group", "ServicePrincipal", "ManagedIdentity", "ForeignGroup", "Device")
 
     # Scan depth levels
     DEPTH_MANAGEMENT_GROUPS = 'management-groups'
@@ -284,14 +285,19 @@ class AssignmentFilter:
         self.principal_type_filter = self._parse_list_filter(args.principal_type_filter)
         self.assignment_type_filter = self._parse_list_filter(getattr(args, 'assignment_type_filter', None))
         self.principal_name_pattern = None
-        self.exclude_system = args.exclude_system
+        self.exclude_managed_identities = getattr(args, 'exclude_managed_identities', False)
+        for option, values, valid in (('--assignment-type-filter', self.assignment_type_filter, ARAConfig.ASSIGNMENT_TYPES),
+                                      ('--principal-type-filter', self.principal_type_filter, ARAConfig.PRINCIPAL_TYPES)):
+            unknown = [v for v in values or [] if v not in [t.lower() for t in valid]]
+            if unknown:
+                raise ValidationError(f"Unknown value for {option}: {', '.join(unknown)}. Valid values: {', '.join(valid)}")
         
         # Compile regex pattern for principal name filter
         if args.principal_name_filter:
             try:
                 self.principal_name_pattern = re.compile(args.principal_name_filter, re.IGNORECASE)
             except re.error as e:
-                raise ValueError(f"Invalid regex pattern in --principal-name-filter: {e}")
+                raise ValidationError(f"Invalid regex pattern in --principal-name-filter: {e}")
     
     @staticmethod
     def _parse_list_filter(filter_value: Optional[str]) -> Optional[List[str]]:
@@ -337,8 +343,12 @@ class AssignmentFilter:
             self.principal_type_filter or
             self.assignment_type_filter or
             self.principal_name_pattern or
-            self.exclude_system
+            self.exclude_managed_identities
         )
+
+    def needs_graph(self) -> bool:
+        """True when a filter depends on names or types that only Microsoft Graph supplies."""
+        return bool(self.principal_name_pattern or self.exclude_managed_identities)
     
     def _matches(self, assignment: 'RoleAssignment') -> bool:
         """Check if an assignment matches all filter criteria.
@@ -361,15 +371,13 @@ class AssignmentFilter:
         if self.assignment_type_filter and assignment.assignment_type.lower() not in self.assignment_type_filter:
             return False
         
-        # Principal name pattern filter
-        if self.principal_name_pattern and not self.principal_name_pattern.search(assignment.principal_name):
+        # Principal name pattern filter; rows without a name never match
+        if self.principal_name_pattern and not (assignment.principal_name and
+                                                self.principal_name_pattern.search(assignment.principal_name)):
             return False
         
-        # Exclude system-assigned managed identities
-        if self.exclude_system and assignment.principal_type.lower() == 'serviceprincipal':
-            # System-assigned managed identities typically have names matching the resource
-            if assignment.principal_name and assignment.principal_name.lower().startswith('system-'):
-                return False
+        if self.exclude_managed_identities and assignment.principal_type == 'ManagedIdentity':
+            return False
         
         return True
     
@@ -393,8 +401,8 @@ class AssignmentFilter:
         if self.principal_name_pattern:
             summary['principal_name_filter'] = self.principal_name_pattern.pattern
         
-        if self.exclude_system:
-            summary['exclude_system'] = True
+        if self.exclude_managed_identities:
+            summary['exclude_managed_identities'] = True
         
         return summary
 
@@ -1111,101 +1119,53 @@ class Scanner:
             result.subscriptions_scanned += 1
 
 
-class GraphAPIClient:
-    """Client for Microsoft Graph API operations."""
-    
-    def __init__(self):
-        """Initialize Graph API client."""
-        self.token = None
-        self._principal_cache = {}
-        self._graph_token_fetched = False
-    
-    def _get_graph_token(self) -> Optional[str]:
-        """Get Graph API token from Azure CLI."""
-        if self._graph_token_fetched:
-            return self.token
-        
-        try:
-            # Get Graph API token specifically
-            cmd = ['az', 'account', 'get-access-token', '--resource', 'https://graph.microsoft.com']
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=ARAConfig.TOKEN_VALIDATION_TIMEOUT
-            )
-            
-            if result.returncode == 0:
-                token_data = json.loads(result.stdout)
-                self.token = token_data.get('accessToken')
-                self._graph_token_fetched = True
-                logger.debug("Successfully obtained Graph API token")
-                return self.token
+class GraphAPIClient(HttpClient):
+    """HttpClient for Microsoft Graph."""
+    IDS_PER_CALL = 1000  # getByIds limit
+
+    @classmethod
+    def create(cls, az_token: Callable[[], Optional[str]]) -> Optional['GraphAPIClient']:
+        """Token from AZURE_GRAPH_TOKEN, else from az_token(); None when neither gives one."""
+        token = os.environ.get('AZURE_GRAPH_TOKEN') or az_token()
+        return cls(token) if token else None
+
+    def get_by_ids(self, ids: List[str]) -> Dict[str, Dict]:
+        """Look up users, groups and service principals; maps lowercased id to the returned object."""
+        found = {}  # type: Dict[str, Dict]
+        for i in range(0, len(ids), self.IDS_PER_CALL):
+            page = self.request("POST", f"{ARAConfig.GRAPH_API_URL}/directoryObjects/getByIds",
+                                body={"ids": ids[i:i + self.IDS_PER_CALL], "types": ["user", "group", "servicePrincipal"]})
+            found.update((obj["id"].lower(), obj) for obj in page.get("value", []) if obj.get("id"))
+        return found
+
+
+class PrincipalResolver:
+    """Fills principal names: PIM names first, then Microsoft Graph in batches."""
+
+    def __init__(self, graph: Optional[GraphAPIClient]):
+        self.graph = graph
+
+    def resolve(self, assignments: List[RoleAssignment]) -> Tuple[List[RoleAssignment], str]:
+        """Return the assignments with names filled in, and the names status."""
+        if self.graph is None:
+            logger.warning("No Microsoft Graph token. Principal names come from PIM only.")
+        else:
+            try:
+                found = self.graph.get_by_ids(sorted({a.principal_id.lower() for a in assignments}))
+            except ARAError as e:
+                logger.warning(f"Microsoft Graph lookup failed: {e}. Principal names come from PIM only.")
             else:
-                logger.debug(f"Failed to get Graph token: {result.stderr}")
-                self._graph_token_fetched = True
-                return None
-                
-        except Exception as e:
-            logger.debug(f"Could not get Graph API token: {e}")
-            self._graph_token_fetched = True
-            return None
-    
-    def get_principal_display_name(self, principal_id: str, principal_type: str) -> str:
-        """Get the display name for a principal."""
-        # Check cache first
-        if principal_id in self._principal_cache:
-            return self._principal_cache[principal_id]
-        
-        # Try to fetch from Graph API
-        try:
-            display_name = self._fetch_principal_name(principal_id, principal_type)
-            self._principal_cache[principal_id] = display_name
-            return display_name
-        except Exception as e:
-            logger.debug(f"Could not resolve principal {principal_id}: {e}")
-            # Fallback to "Unknown" (matches Azure Portal behavior)
-            self._principal_cache[principal_id] = "Unknown"
-            return "Unknown"
-    
-    def _fetch_principal_name(self, principal_id: str, principal_type: str) -> str:
-        """Fetch principal name from Graph API."""
-        # Get Graph token if not already obtained
-        token = self._get_graph_token()
-        if not token:
-            # No token available, return ID
-            return principal_id
-        
-        # Endpoint mapping based on principal type
-        endpoint_map = {
-            'User': 'users',
-            'Group': 'groups',
-            'ServicePrincipal': 'servicePrincipals'
-        }
-        
-        endpoint = endpoint_map.get(principal_type, 'directoryObjects')
-        url = f"{ARAConfig.GRAPH_API_URL}/{endpoint}/{principal_id}"
-        
-        headers = {
-            'Authorization': f'Bearer {token}',
-            'Content-Type': 'application/json',
-        }
-        
-        try:
-            request = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(request, timeout=ARAConfig.API_REQUEST_TIMEOUT) as response:
-                data = json.loads(response.read().decode())
-                display_name = data.get('displayName', data.get('userPrincipalName', 'Unknown'))
-                logger.debug(f"Resolved {principal_id} -> {display_name}")
-                return display_name
-                
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode() if hasattr(e, 'read') else ''
-            logger.debug(f"Graph API HTTP error for {principal_id}: {e.code} - {error_body}")
-            return "Unknown"
-        except Exception as e:
-            logger.debug(f"Graph API error for {principal_id}: {e}")
-            return "Unknown"
+                return [self._apply(a, found.get(a.principal_id.lower())) for a in assignments], "resolved"
+        named = sum(1 for a in assignments if a.principal_name)
+        return assignments, "resolved" if named == len(assignments) else "unavailable" if named == 0 else "partial"
+
+    @staticmethod
+    def _apply(assignment: RoleAssignment, obj: Optional[Dict]) -> RoleAssignment:
+        if obj is None:
+            return assignment if assignment.principal_name else replace(assignment, principal_name="Unknown")
+        principal_type = 'ManagedIdentity' if obj.get('servicePrincipalType') == 'ManagedIdentity' else assignment.principal_type
+        return replace(assignment, principal_name=obj.get('displayName') or assignment.principal_name,
+                       principal_type=principal_type)
 
 
 # Output Handlers
