@@ -3,21 +3,12 @@
 ARA, the role atlas for Azure
 =============================
 
-A professional tool for exporting Azure role assignments at management group
-and subscription scopes with comprehensive reporting, PIM integration, and 
-multiple output formats.
+Scans the role assignments under an Azure management group or subscription,
+reads PIM eligibility, resolves principal names, and writes a self-contained
+HTML report and a JSON file. A CSV file is written on request.
 
-Features:
-- PIM (Privileged Identity Management) integration - distinguish between active 
-  permanent, active time-bound, eligible permanent, and eligible time-bound assignments
-- Multiple authentication methods (token argument, environment, Azure CLI, interactive)
-- Hierarchical management group scanning
-- Principal name resolution via Microsoft Graph API
-- JSON and CSV output formats
-- Direct assignment filtering (excludes inherited)
-- Robust error handling and logging
-- Production-ready with proper OOP design
-- Zero external dependencies
+Direct assignments only; inherited assignments are not listed. Python standard
+library only.
 
 Requirements:
 - Python 3.7+

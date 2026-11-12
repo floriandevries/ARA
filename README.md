@@ -145,7 +145,7 @@ Filters apply to the output. Values are comma-separated; unknown values are a us
 | `--principal-name-filter "^Admin"` | Principal name, regex, case-insensitive |
 | `--exclude-managed-identities` | Leaves out managed identities |
 
-`--principal-name-filter` and `--exclude-managed-identities` need a Microsoft Graph token. ARA checks this before scanning and stops with exit code 1 if it has none.
+`--principal-name-filter` and `--exclude-managed-identities` need a Microsoft Graph token. ARA checks this before scanning and stops with exit code 1 if it has none. If the scan runs but Graph could not name every principal, these two filters are not applied: the report shows every assignment and says so in a banner. The scan then counts as incomplete (exit code 3) and the output goes to the `.partial` files.
 
 ## Output
 
@@ -169,7 +169,8 @@ Filters apply to the output. Values are comma-separated; unknown values are a us
     "management_groups_scanned": 2,
     "subscriptions_scanned": 5,
     "scopes_with_assignments": 15,
-    "total_assignments_found": 42
+    "total_assignments_found": 42,
+    "assignments_before_filters": 42
   },
   "role_assignments": []
 }
@@ -201,7 +202,7 @@ If a scope could not be read, or the scan was stopped, ARA still writes what it 
 - **Exit code 3 or a banner about failed scopes**: the failed scopes and their errors are in the JSON under `failed_scopes`. Check that you have read access there, then run again.
 - **PIM banner**: your account may lack permission to read PIM schedules. Assignments then have the type `Active`. Use `--skip-pim` to skip PIM on purpose.
 - **Rows named `Unknown` or showing IDs**: see Principal names. For names beyond PIM you need a Graph token (`az login`, or `AZURE_GRAPH_TOKEN`).
-- **Throttling (429)**: ARA retries up to four times. Raise `--api-delay` if it keeps happening.
+- **Throttling (429)**: ARA tries each request up to four times. Raise `--api-delay` if it keeps happening.
 - **`--principal-name-filter` stops immediately**: it needs a Graph token, see Filters.
 - **Debugging**: add `--debug`. Use `--no-progress` for logs.
 
