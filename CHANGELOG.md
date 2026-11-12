@@ -5,7 +5,9 @@ All notable changes to ARA (which began as the Azure Role Assignment Exporter) w
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [3.0.0] - 2026-11-12
+## [4.0.0] - 2026-11-12
+
+The version number skips 3.0.0: the tag and GitHub release `v3.0.0` (2026-02-05) already exist and contain the code this changelog lists as 2.1.0.
 
 ### Breaking
 - Removed `--max-resources` and `--exclude-system`. `--exclude-managed-identities` replaces the latter and filters on the `ManagedIdentity` principal type.
@@ -44,7 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [2.1.0] - 2026-02-05
+## [2.1.0] - 2026-02-05 (published as tag `v3.0.0`)
 
 ### Removed
 

@@ -3,7 +3,7 @@
 ARA, the role atlas for Azure. Who can do what, and where.
 
 [![Python 3.7+](https://img.shields.io/badge/python-3.7+-blue.svg)](https://www.python.org/downloads/)
-[![Version](https://img.shields.io/badge/version-3.0.0-green.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-4.0.0-green.svg)](CHANGELOG.md)
 
 ARA scans a management group, a subscription or a whole tenant and writes an HTML report of who holds which Azure role, and where. It is one Python file with no Python packages to install. A scan only reads: it changes nothing in Azure.
 
@@ -20,7 +20,7 @@ ARA scans a management group, a subscription or a whole tenant and writes an HTM
 git clone https://github.com/fjdev/ARA.git
 cd ARA
 chmod +x ara
-./ara --version    # ARA 3.0.0
+./ara --version    # ARA 4.0.0
 ```
 
 Run `az login` first, or pass a token with `--token`, or set `AZURE_ACCESS_TOKEN`. One `az login` covers both Azure and Microsoft Graph.
@@ -188,7 +188,7 @@ When the tenant is known, the files are named `role_assignments_<tenant>_<scope>
 {
   "metadata": {
     "tool": "ARA",
-    "version": "3.0.0",
+    "version": "4.0.0",
     "schema_version": 3,
     "scan_timestamp": "2026-11-12T08:14:00Z",
     "scope": "/providers/Microsoft.Management/managementGroups/my-mg",
@@ -244,7 +244,7 @@ If a scope could not be read, or the scan was stopped, ARA still writes what it 
 
 ## History
 
-ARA began as the Azure Role Assignment Exporter. Version 3.0 added the report and made the scan check that it has read everything.
+ARA began as the Azure Role Assignment Exporter. Version 4.0 added the report and made the scan check that it has read everything.
 
 ## Licence
 

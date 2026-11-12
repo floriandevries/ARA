@@ -404,7 +404,7 @@ class ScannerTest(unittest.TestCase):
     def test_to_dict_metadata(self):
         m = self.scanner().scan(self.ref(), "subscriptions").to_dict()["metadata"]
         self.assertEqual((m["tool"], m["version"], m["schema_version"], m["complete"], m["pim"], m["depth"]),
-                         ("ARA", "3.0.0", 3, True, "included", "subscriptions"))
+                         ("ARA", "4.0.0", 3, True, "included", "subscriptions"))
         self.assertRegex(m["scan_timestamp"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
         for gone in ("total_scopes_scanned",): self.assertNotIn(gone, m)
     def test_subscription_scan_is_named_after_its_display_name(self):
@@ -700,12 +700,12 @@ class DocsTest(unittest.TestCase):
         for flag in ("--output-dir", "--exclude-managed-identities", "--skip-pim", "--format csv"): self.assertIn(flag, text)
         for gone in ("--max-resources", "--exclude-system", "Keychain", "PERFORMANCE.md", "2.0.0", "2.1.0", "LRU", "code%20style-black"):
             self.assertNotIn(gone, text)
-        self.assertIn("3.0.0", text)
+        self.assertIn("4.0.0", text)
         self.assertEqual(set(re.findall(r"([\w-]+)\.onmicrosoft\.com", text.lower())), {"contoso"})
         for phrase in ("assignments_before_filters", "no filters are applied", "the Graph lookup failed or left principals unnamed",
                        "assignments inherited from above it are not", "renewed when it expires"): self.assertIn(phrase, text)
     def test_changelog_has_3_0_0(self):
-        self.assertIn("## [3.0.0]", (self.ROOT / "CHANGELOG.md").read_text())
+        self.assertIn("## [4.0.0]", (self.ROOT / "CHANGELOG.md").read_text())
 
 if __name__ == "__main__":
     unittest.main()
