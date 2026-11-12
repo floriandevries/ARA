@@ -65,6 +65,7 @@ class ARAConfig:
     AZURE_API_VERSION = "2020-01-01"
     AUTH_API_VERSION = "2022-04-01"
     MGMT_GROUP_API_VERSION = "2020-05-01"
+    PIM_API_VERSION = "2020-10-01"
     
     # Timeouts
     API_REQUEST_TIMEOUT = 30  # seconds
@@ -166,6 +167,11 @@ class APIError(ARAError):
     def __init__(self, message: str, status: Optional[int] = None):
         super().__init__(message)
         self.status = status
+
+
+class PIMUnavailable(ARAError):
+    """Raised when the PIM lists are forbidden (HTTP 403)."""
+    pass
 
 
 class ExportError(ARAError):
@@ -920,107 +926,80 @@ class DepthFilter:
         return True
 
 
-class PIMClient:
-    """Client for Azure PIM (Privileged Identity Management) operations."""
-    
-    def __init__(self, api_client: AzureAPIClient):
-        """Initialize PIM client."""
-        self.api_client = api_client
-        self._pim_available = None  # Cache PIM availability status
-    
-    def get_eligible_assignments_for_scope(self, scope: Scope) -> List[Dict]:
-        """Get eligible role assignments (PIM) for a specific scope.
-        
-        Args:
-            scope: Scope to scan
-            
-        Returns:
-            List of eligible assignment data dictionaries
-        """
-        eligibility_data = []
-        
+class PIMCollector:
+    """Lists PIM eligible and active schedule instances once per management group or subscription."""
+
+    def __init__(self, api: AzureAPIClient):
+        self.api = api
+
+    def _list(self, scope: Scope, kind: str) -> List[Dict]:
+        mg = scope.scope_type == 'Management Group'
+        params = {"api-version": ARAConfig.PIM_API_VERSION}
+        if mg:
+            params["$filter"] = "atScope()"
         try:
-            # Azure PIM API endpoint for eligible role assignments
-            url = (f"{ARAConfig.AZURE_MANAGEMENT_URL}{scope.scope_path}/"
-                   f"providers/Microsoft.Authorization/roleEligibilityScheduleInstances"
-                   f"?api-version=2020-10-01")
-            
-            data = self.api_client.get(url)
-            
-            for eligibility in data.get('value', []):
-                # Extract the scope from the eligibility
-                props = eligibility.get('properties', {})
-                eligibility_scope = props.get('scope', '').lower()
-                
-                # Only include eligible assignments directly assigned to this scope
-                if eligibility_scope != scope.scope_path.lower():
-                    continue
-                
-                eligibility_data.append(eligibility)
-            
-            # Mark PIM as available if we got this far
-            if self._pim_available is None:
-                self._pim_available = True
-                
-        except Exception as e:
-            # It's common for scopes to not have PIM enabled, so we log at debug level
-            logger.debug(f"No eligible assignments or PIM not enabled for {scope.name}: {e}")
-            
-            # Mark PIM as unavailable on permission errors
-            if self._pim_available is None and ('403' in str(e) or '404' in str(e) or 'permission' in str(e).lower()):
-                self._pim_available = False
-        
-        return eligibility_data
-    
-    def get_time_bound_active_assignments_for_scope(self, scope: Scope) -> List[Dict]:
-        """Get active role assignment schedule instances (PIM) for a specific scope.
-        
-        This fetches ALL assignments from the roleAssignmentScheduleInstances API, which includes:
-        - Time-bound active assignments (PIM-activated with endDateTime)
-        - Permanent active assignments created via PIM (no endDateTime, typically service principals)
-        
-        Caller must check endDateTime to distinguish between permanent and time-bound.
-        
-        Args:
-            scope: Scope to scan
-            
-        Returns:
-            List of active assignment schedule data dictionaries
-        """
-        time_bound_data = []
-        
+            rows = self.api.get_all(self.api.url(f"{scope.scope_path}/providers/Microsoft.Authorization/{kind}"), params)
+        except APIError as e:
+            if e.status == 403:
+                raise PIMUnavailable(str(e)) from e
+            raise
+        at = lambda r: r.get('properties', {}).get('scope', '')
+        if mg:
+            return [r for r in rows if at(r).lower() == scope.scope_path.lower()]
+        return [r for r in rows if AssignmentCollector.inside(at(r), scope.scope_path)]
+
+    def eligible(self, scope: Scope) -> List[Dict]:
+        return self._list(scope, "roleEligibilityScheduleInstances")
+
+    def active(self, scope: Scope) -> List[Dict]:
+        return self._list(scope, "roleAssignmentScheduleInstances")
+
+
+class AssignmentBuilder:
+    """Turns RBAC rows and PIM schedule instances into RoleAssignments."""
+
+    def __init__(self, role_names: Dict[str, str], subscription_names: Dict[str, str]):
+        self.role_names = role_names  # lowercased role definition GUID to name
+        self.subscription_names = subscription_names  # lowercased subscription GUID to display name
+
+    def build(self, rbac_rows: List[Dict], active_instances: Optional[List[Dict]],
+              eligible_instances: Optional[List[Dict]]) -> List[RoleAssignment]:
+        """None for the instance lists means PIM was skipped or unavailable."""
+        by_origin = {}  # type: Dict[str, Dict]
+        for i in active_instances or []:
+            origin = i.get('properties', {}).get('originRoleAssignmentId')
+            if origin:
+                by_origin[origin.lower()] = i['properties']
+        out = []  # type: List[RoleAssignment]
+        for r in rbac_rows:
+            inst = by_origin.get(r.get('id', '').lower(), {})
+            kind = ('Active time-bound' if inst.get('endDateTime') else 'Active permanent') if inst else 'Active'
+            self._add(out, r.get('properties', {}), inst, kind)
+        for e in eligible_instances or []:
+            p = e.get('properties', {})
+            self._add(out, p, p, 'Eligible time-bound' if p.get('endDateTime') else 'Eligible permanent')
+        return out
+
+    def _add(self, out: List[RoleAssignment], props: Dict, inst: Dict, kind: str) -> None:
+        """props gives principal, role and scope; inst (a schedule instance, or {}) gives names and dates."""
+        expanded = inst.get('expandedProperties') or {}
+        role_id = props.get('roleDefinitionId', '')
+        guid = role_id.rsplit('/', 1)[-1]
         try:
-            # Azure PIM API endpoint for active role assignment schedules
-            url = (f"{ARAConfig.AZURE_MANAGEMENT_URL}{scope.scope_path}/"
-                   f"providers/Microsoft.Authorization/roleAssignmentScheduleInstances"
-                   f"?api-version=2020-10-01")
-            
-            data = self.api_client.get(url)
-            
-            for assignment in data.get('value', []):
-                # Extract the scope from the assignment
-                props = assignment.get('properties', {})
-                assignment_scope = props.get('scope', '').lower()
-                
-                # Only include assignments directly assigned to this scope
-                if assignment_scope != scope.scope_path.lower():
-                    continue
-                
-                time_bound_data.append(assignment)
-                
-        except Exception as e:
-            # It's common for scopes to not have PIM enabled, so we log at debug level
-            logger.debug(f"No time-bound active assignments or PIM not enabled for {scope.name}: {e}")
-        
-        return time_bound_data
-    
-    def is_pim_available(self) -> Optional[bool]:
-        """Check if PIM is available based on previous API calls.
-        
-        Returns:
-            True if PIM is available, False if unavailable, None if not yet determined
-        """
-        return self._pim_available
+            scope = Scope.from_path(props.get('scope', ''))
+            name = scope.name
+            if scope.scope_type == 'Subscription':
+                name = self.subscription_names.get(scope.subscription_id.lower(), name)
+            out.append(RoleAssignment(
+                principal_id=props.get('principalId', ''),
+                principal_name=(expanded.get('principal') or {}).get('displayName') or None,
+                principal_type=props.get('principalType', 'Unknown'),
+                role_name=self.role_names.get(guid.lower()) or (expanded.get('roleDefinition') or {}).get('displayName') or guid,
+                role_id=role_id, scope=scope.scope_path, scope_name=name, scope_type=scope.scope_type,
+                resource_type=scope.resource_type, assignment_type=kind,
+                start_date_time=inst.get('startDateTime'), end_date_time=inst.get('endDateTime')))
+        except ValidationError as e:
+            logger.debug(f"Skipping assignment: {e}")
 
 
 class GraphAPIClient:
@@ -1322,7 +1301,7 @@ class ARAApplication:
             # Initialize basic clients
             hierarchy = HierarchyClient(api_client)
             ra_client = AssignmentCollector(api_client)
-            pim_client = PIMClient(api_client)  # PIM eligible and time-bound assignments
+            pim_client = PIMCollector(api_client)
             graph_client = GraphAPIClient()  # Gets its own Graph token
             
             # Normalize scope - support multiple formats for both MG and subscriptions
@@ -1497,7 +1476,7 @@ class ARAApplication:
     
     def _scan_scope_assignments(self, scope: Scope, results: ScanResult, 
                                 ra_client: AssignmentCollector,
-                                pim_client: PIMClient,
+                                pim_client: PIMCollector,
                                 graph_client: GraphAPIClient, 
                                 indent: str,
                                 assignment_filter: Optional['AssignmentFilter'] = None,
@@ -1536,7 +1515,7 @@ class ARAApplication:
             
             # Fetch eligible assignments (PIM)
             try:
-                eligible_data = pim_client.get_eligible_assignments_for_scope(scope)
+                eligible_data = pim_client.eligible(scope)
                 
                 for eligibility_data in eligible_data:
                     props = eligibility_data.get('properties', {})
@@ -1592,7 +1571,7 @@ class ARAApplication:
             
             # Fetch time-bound active assignments (PIM activated)
             try:
-                timebound_data = pim_client.get_time_bound_active_assignments_for_scope(scope)
+                timebound_data = pim_client.active(scope)
                 
                 for timebound_assignment in timebound_data:
                     props = timebound_assignment.get('properties', {})

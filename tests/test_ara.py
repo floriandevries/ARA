@@ -111,12 +111,14 @@ class HttpClientTest(unittest.TestCase):
 
 class FakeAPI:
     """Stands in for AzureAPIClient: maps a URL substring to rows (get_all) or a dict (get); records each call."""
-    def __init__(self, routes):
-        self.routes = routes; self.calls = []
+    def __init__(self, routes, error=None):
+        self.routes = routes; self.calls = []; self.error = error
     def url(self, path):
         return "https://m" + path
     def get(self, url, params=None):
         self.calls.append(url + "?" + urllib.parse.urlencode(params or {}))
+        if self.error:
+            raise self.error
         for key, value in self.routes.items():
             if key in url:
                 return value
@@ -129,6 +131,18 @@ def row(scope, principal="p1", role_guid="acdd72a7-3385-48ef-bd42-f606fba81ae7",
     return {"id": id_, "name": id_.rsplit("/", 1)[-1], "type": "Microsoft.Authorization/roleAssignments",
             "properties": {"scope": scope, "principalId": principal, "principalType": "User",
                            "roleDefinitionId": "/providers/Microsoft.Authorization/roleDefinitions/" + role_guid}}
+
+def instance(scope, origin=None, end=None, principal="p1", name="Ann", kind="Assigned"):
+    """A PIM schedule instance as roleAssignmentScheduleInstances or roleEligibilityScheduleInstances returns it."""
+    props = {"scope": scope, "principalId": principal, "principalType": "User", "assignmentType": kind,
+             "roleDefinitionId": "/providers/Microsoft.Authorization/roleDefinitions/acdd72a7-3385-48ef-bd42-f606fba81ae7",
+             "startDateTime": "2026-11-12T10:00:00Z",
+             "expandedProperties": {"principal": {"displayName": name}, "roleDefinition": {"displayName": "Reader"}}}
+    if origin:
+        props["originRoleAssignmentId"] = origin
+    if end:
+        props["endDateTime"] = end
+    return {"id": scope + "/providers/Microsoft.Authorization/scheduleInstances/x", "properties": props}
 
 class AssignmentCollectorTest(unittest.TestCase):
     S = "/subscriptions/" + G
@@ -180,6 +194,46 @@ class DepthFilterTest(unittest.TestCase):
         self.assertTrue(ara.DepthFilter.keep(vm, "resources", types))
         self.assertFalse(ara.DepthFilter.keep(sa, "resources", types))
         self.assertTrue(ara.DepthFilter.keep(ara.Scope.from_path(S), "resources", types))
+
+class AssignmentBuilderTest(unittest.TestCase):
+    S = "/subscriptions/" + G
+    READER = "acdd72a7-3385-48ef-bd42-f606fba81ae7"
+    def builder(self): return ara.AssignmentBuilder({self.READER: "Reader"}, {G: "Prod"})
+    def test_eligible_and_activated_give_two_rows(self):
+        r = row(self.S, id_="ra1")
+        out = self.builder().build([r], [instance(self.S, origin="ra1", end="2026-11-12T18:00:00Z", kind="Activated")],
+                                   [instance(self.S)])
+        self.assertEqual(sorted(a.assignment_type for a in out), ["Active time-bound", "Eligible permanent"])
+    def test_permanent_active(self):
+        out = self.builder().build([row(self.S, id_="ra1")], [instance(self.S, origin="ra1")], [])
+        self.assertEqual((out[0].assignment_type, out[0].end_date_time, out[0].principal_name), ("Active permanent", None, "Ann"))
+    def test_unmatched_and_pim_off_are_active(self):
+        b = self.builder()
+        self.assertEqual(b.build([row(self.S, id_="ra1")], [], [])[0].assignment_type, "Active")
+        out = b.build([row(self.S, id_="ra1")], None, None)
+        self.assertEqual((out[0].assignment_type, out[0].principal_name), ("Active", None))
+    def test_two_eligibilities_for_same_principal_and_role_are_both_kept(self):
+        out = self.builder().build([], [], [instance(self.S), instance(self.S, end="2026-12-01T00:00:00Z")])
+        self.assertEqual(sorted(a.assignment_type for a in out), ["Eligible permanent", "Eligible time-bound"])
+    def test_unknown_role_definition_falls_back_to_guid(self):
+        out = self.builder().build([row(self.S, role_guid="00000000-0000-0000-0000-00000000dead", id_="ra1")], None, None)
+        self.assertEqual(out[0].role_name, "00000000-0000-0000-0000-00000000dead")
+    def test_scope_fields(self):
+        out = self.builder().build([row(self.S, id_="a"), row(self.S + "/resourceGroups/rg/providers/Microsoft.Network/virtualNetworks/v/subnets/s", id_="b")], None, None)
+        self.assertEqual((out[0].scope_name, out[0].scope_type), ("Prod", "Subscription"))
+        self.assertEqual((out[1].scope_name, out[1].resource_type), ("s", "Microsoft.Network/virtualNetworks/subnets"))
+
+class PIMCollectorTest(unittest.TestCase):
+    def test_403_becomes_pim_unavailable(self):
+        api = FakeAPI({}, error=ara.APIError("forbidden", status=403))
+        with self.assertRaises(ara.PIMUnavailable): ara.PIMCollector(api).eligible(ara.Scope.from_path("/subscriptions/" + G))
+    def test_other_errors_pass_through(self):
+        api = FakeAPI({}, error=ara.APIError("boom", status=500))
+        with self.assertRaises(ara.APIError): ara.PIMCollector(api).active(ara.Scope.from_path(MG))
+    def test_subscription_keeps_inside_rows(self):
+        S = "/subscriptions/" + G
+        api = FakeAPI({"roleEligibilityScheduleInstances": [instance(S + "/resourceGroups/rg"), instance(MG)]})
+        self.assertEqual(len(ara.PIMCollector(api).eligible(ara.Scope.from_path(S))), 1)
 
 if __name__ == "__main__":
     unittest.main()
