@@ -441,7 +441,8 @@ class HTMLReportTest(unittest.TestCase):
         self.assertNotIn("<img src=x", html)
         self.assertEqual(self.data(html)["role_assignments"][0]["principal_name"], '</script><script>alert(1)</script>')
     def test_line_separators_are_escaped(self):
-        self.assertNotIn("\u2028", self.html([ra(name="a\u2028b")]))
+        html = self.html([ra(name="a\u2028b\u2029c")])
+        self.assertNotIn("\u2028", html); self.assertNotIn("\u2029", html)
     def test_report_script_never_builds_html_from_data(self):
         for banned in ("innerHTML", "insertAdjacentHTML", "outerHTML", "document.write"):
             self.assertNotIn(banned, ara.REPORT_TEMPLATE)
@@ -458,6 +459,26 @@ class HTMLReportTest(unittest.TestCase):
     def test_application_writes_report_first(self):
         _, files = run(app(result([ra()])), "--scope", "my-mg")
         self.assertIn("role_assignments_my-mg.html", files)
+    def test_html_handler_comes_first(self):
+        handlers = app().handlers(ara.parse_arguments(["--scope", "my-mg", "--format", "csv"]))
+        self.assertIsInstance(handlers[0], ara.HTMLOutputHandler)
+
+class HTMLReportExtrasTest(unittest.TestCase):
+    T = property(lambda self: ara.REPORT_TEMPLATE)
+    def test_export_uses_the_csv_columns(self):
+        for col in ara.CSVOutputHandler.COLUMNS: self.assertIn(col, self.T)
+        self.assertIn("_filtered.csv", self.T)
+    def test_theme_and_print_hooks_exist(self):
+        for needle in ("prefers-color-scheme", "data-theme", "ara-theme", "@media print", "prefers-reduced-motion"):
+            self.assertIn(needle, self.T)
+    def test_state_is_kept_in_the_fragment(self):
+        for needle in ("replaceState", "hashchange"): self.assertIn(needle, self.T)
+    def test_still_no_html_injection_or_external_urls(self):
+        for banned in ("innerHTML", "insertAdjacentHTML", "outerHTML", "document.write"): self.assertNotIn(banned, self.T)
+        self.assertIsNone(re.search(r"https?://", self.T))
+    def test_twenty_thousand_rows_stay_under_fifteen_megabytes(self):
+        html = ara.HTMLOutputHandler("x").render(result([ra(pid="p%d" % i) for i in range(20000)]))
+        self.assertLess(len(html.encode("utf-8")), 15 * 1024 * 1024)
 
 class ConsoleSummaryTest(unittest.TestCase):
     def test_states_pim_failed_scopes_and_paths(self):
