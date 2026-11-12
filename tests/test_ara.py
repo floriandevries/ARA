@@ -701,6 +701,7 @@ class DocsTest(unittest.TestCase):
         for gone in ("--max-resources", "--exclude-system", "Keychain", "PERFORMANCE.md", "2.0.0", "2.1.0", "LRU", "code%20style-black"):
             self.assertNotIn(gone, text)
         self.assertIn("3.0.0", text)
+        self.assertNotIn("cgkcaf", text.lower())
         for phrase in ("assignments_before_filters", "no filters are applied", "the Graph lookup failed or left principals unnamed",
                        "assignments inherited from above it are not", "renewed when it expires"): self.assertIn(phrase, text)
     def test_changelog_has_3_0_0(self):
