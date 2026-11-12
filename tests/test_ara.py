@@ -185,6 +185,55 @@ class HierarchyClientTest(unittest.TestCase):
         mgs, subs = ara.HierarchyClient(FakeAPI({"managementGroups/root": {"name": "root", "properties": {"displayName": "Root", "children": None}}})).management_group_tree("root")
         self.assertEqual((len(mgs), subs), (1, []))
 
+class TenantTest(unittest.TestCase):
+    TENANTS = {"/tenants": [{"tenantId": "AAA", "displayName": "Other", "defaultDomain": "other.onmicrosoft.com"},
+                            {"tenantId": "bbb-1", "displayName": "Contoso", "defaultDomain": "contoso.onmicrosoft.com"}]}
+    def test_tenant_matches_id_ignoring_case(self):
+        api = FakeAPI(self.TENANTS); h = ara.HierarchyClient(api); h.tenant_id = "BBB-1"
+        self.assertEqual(h.tenant(), {"id": "bbb-1", "name": "Contoso", "domain": "contoso.onmicrosoft.com"})
+        self.assertIn("api-version=2022-12-01", api.calls[0])
+    def test_tenant_failure_keeps_id(self):
+        h = ara.HierarchyClient(FakeAPI({}, error=ara.APIError("no", 403))); h.tenant_id = "t"
+        self.assertEqual(h.tenant(), {"id": "t", "name": None, "domain": None})
+    def test_tenant_not_in_list_keeps_id(self):
+        h = ara.HierarchyClient(FakeAPI(self.TENANTS)); h.tenant_id = "zzz"
+        self.assertEqual(h.tenant(), {"id": "zzz", "name": None, "domain": None})
+    def test_tenant_unknown_without_root(self):
+        self.assertIsNone(ara.HierarchyClient(FakeAPI(self.TENANTS)).tenant())
+    def test_roots_set_tenant_id(self):
+        h = ara.HierarchyClient(FakeAPI({"managementGroups/root": {"properties": {"tenantId": "t1"}}})); h.management_group_tree("root")
+        self.assertEqual(h.tenant_id, "t1")
+        h = ara.HierarchyClient(FakeAPI({"/subscriptions/": {"tenantId": "t2"}})); h.subscription(G)
+        self.assertEqual(h.tenant_id, "t2")
+    def test_scan_records_tenant(self):
+        class H(FakeHierarchy):
+            def tenant(self): return {"id": "t", "name": "Contoso", "domain": None}
+        r = ara.Scanner(H(mgs=[ara.Scope.from_path(MG)]), FakeCollector({}), None, show_progress=False).scan(
+            ara.ScopeRef(MG, "management-group", "my-mg"), "management-groups")
+        self.assertEqual(r.tenant["name"], "Contoso")
+    def test_metadata_and_file_names(self):
+        t = {"id": "t", "name": "Contoso", "domain": "contoso.onmicrosoft.com"}
+        r = result([], tenant=t); h = ara.JSONOutputHandler("x")
+        self.assertEqual(r.to_dict()["metadata"]["tenant"]["name"], "Contoso")
+        self.assertEqual(h.file_name(r), "role_assignments_contoso_my-mg.json")
+        self.assertEqual(h.file_name(result([], tenant=dict(t, domain=None))), "role_assignments_Contoso_my-mg.json")
+        self.assertEqual(h.file_name(result([], tenant=None)), "role_assignments_my-mg.json")
+        self.assertIsNone(result([]).to_dict()["metadata"]["tenant"])
+    def test_console_first_line(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ara.ConsoleSummary().print(result([], tenant={"id": "t", "name": "Contoso", "domain": "contoso.onmicrosoft.com"}), [])
+            ara.ConsoleSummary().print(result([], tenant={"id": "t", "name": None, "domain": None}), [])
+        lines = buf.getvalue().splitlines()
+        self.assertEqual(lines[0], "Tenant: Contoso (contoso.onmicrosoft.com)")
+        self.assertIn("Tenant: t", lines)
+    def test_report_embeds_tenant_and_hostile_name_stays_inert(self):
+        html = ara.HTMLOutputHandler("x").render(result([], tenant={"id": "t", "name": "</script><b>x", "domain": "d"}))
+        self.assertEqual(html.count("</script>"), 2)
+        self.assertNotIn("<b>x", html)
+        m = re.search(r'<script type="application/json" id="ara-data">(.*?)</script>', html, re.S)
+        self.assertEqual(json.loads(m.group(1))["metadata"]["tenant"]["name"], "</script><b>x")
+
 class DepthFilterTest(unittest.TestCase):
     def test_depths(self):
         S = "/subscriptions/" + G

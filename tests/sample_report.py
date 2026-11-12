@@ -58,7 +58,8 @@ def main() -> None:
     n = int(sys.argv[1])
     incomplete = "--incomplete" in sys.argv[2:]
     result = ara.ScanResult(MG + "mg-platform", "mg-platform", "resources", "2026-11-12T09:14:00Z", list(rows(n)),
-                            management_groups_scanned=2, subscriptions_scanned=2, names="resolved")
+                            management_groups_scanned=2, subscriptions_scanned=2, names="resolved",
+                            tenant={"id": "00000000-aaaa-bbbb-cccc-000000000000", "name": "Contoso", "domain": "contoso.onmicrosoft.com"})
     if incomplete:
         result.failed_scopes = [{"scope": SUB.format(3), "error": "403 Forbidden"},
                                 {"scope": SUB.format(4), "error": "Timed out"}]

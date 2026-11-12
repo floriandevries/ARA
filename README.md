@@ -18,9 +18,15 @@ Every scan writes two files into `results/` (or the directory you give with `--o
 
 `--format csv` also writes `role_assignments_<scope>.csv`.
 
+When the tenant is known, the files are named `role_assignments_<tenant>_<scope>.<ext>`, where `<tenant>` is the part of the tenant's default domain before the first dot (`cgkcaf` for `cgkcaf.onmicrosoft.com`), or the tenant name when the domain is missing. When it is unknown the `<tenant>_` part is left out.
+
 `<scope>` is the scope id. A scan of a subscription or of the tenant root group, whose ids are GUIDs, is named after its display name instead, for example `role_assignments_Sandbox.html` or `role_assignments_Tenant_Root_Group.html`.
 
 ### The report
+
+The heading shows the tenant name above the scope name, with the tenant's default domain after it. If the name could not be read it shows the tenant id; if the tenant is unknown it shows nothing. The browser tab title is `ARA <tenant name> <scope name>`. The console summary starts with `Tenant: <name> (<domain>)`.
+
+The metadata field `tenant` is `{"id", "name", "domain"}`, or `null` when the tenant is unknown. `name` and `domain` are `null` when the tenant list could not be read (one extra call to `/tenants`); that never makes a scan incomplete.
 
 The report has, from top to bottom:
 
@@ -163,6 +169,7 @@ Filters apply to the output. Values are comma-separated; unknown values are a us
     "schema_version": 3,
     "scan_timestamp": "2026-11-12T08:14:00Z",
     "scope": "/providers/Microsoft.Management/managementGroups/my-mg",
+    "tenant": {"id": "00000000-0000-0000-0000-000000000000", "name": "Contoso", "domain": "contoso.onmicrosoft.com"},
     "depth": "resource-groups",
     "complete": true,
     "failed_scopes": [],

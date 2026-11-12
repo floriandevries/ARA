@@ -61,6 +61,7 @@ class ARAConfig:
     AUTH_API_VERSION = "2022-04-01"
     MGMT_GROUP_API_VERSION = "2020-05-01"
     PIM_API_VERSION = "2020-10-01"
+    TENANT_API_VERSION = "2022-12-01"
     
     # Timeouts
     API_REQUEST_TIMEOUT = 30  # seconds
@@ -520,6 +521,7 @@ class ScanResult:
     stopped: bool = False
     interrupted: bool = False
     filters_not_applied: bool = False
+    tenant: Optional[Dict[str, Optional[str]]] = None  # {"id", "name", "domain"}
 
     @property
     def complete(self) -> bool:
@@ -547,6 +549,7 @@ class ScanResult:
                 "schema_version": 3,
                 "scan_timestamp": self.scan_timestamp,
                 "scope": self.scope,
+                "tenant": self.tenant,
                 "depth": self.depth,
                 "complete": self.complete,
                 "failed_scopes": self.failed_scopes,
@@ -780,12 +783,14 @@ class HierarchyClient:
 
     def __init__(self, api: AzureAPIClient):
         self.api = api
+        self.tenant_id = None  # type: Optional[str]
 
     def management_group_tree(self, mg_id: str) -> Tuple[List[Scope], List[Scope]]:
         """Management groups (root first) and subscriptions under mg_id, from one recursive call."""
         root = self.api.get(self.api.url(f"/providers/Microsoft.Management/managementGroups/{mg_id}"), {
             "api-version": ARAConfig.MGMT_GROUP_API_VERSION, "$expand": "children", "$recurse": "true"})
         props = root.get('properties') or {}
+        self.tenant_id = props.get('tenantId')
         mgs = [Scope(f"/providers/Microsoft.Management/managementGroups/{mg_id}",
                      props.get('displayName') or mg_id, 'Management Group')]
         subs = []  # type: List[Scope]
@@ -809,8 +814,23 @@ class HierarchyClient:
         """The subscription with its display name. APIError passes through."""
         data = self.api.get(self.api.url(f"/subscriptions/{subscription_id}"),
                             {"api-version": ARAConfig.AZURE_API_VERSION})
+        self.tenant_id = data.get('tenantId')
         return Scope(f"/subscriptions/{subscription_id}", data.get('displayName') or subscription_id,
                      'Subscription', subscription_id=subscription_id)
+
+    def tenant(self) -> Optional[Dict[str, Optional[str]]]:
+        """Name and default domain of the tenant of the root that was read; never fails the scan."""
+        if not self.tenant_id:
+            return None
+        try:
+            rows = self.api.get_all(self.api.url("/tenants"), {"api-version": ARAConfig.TENANT_API_VERSION})
+        except ARAError as e:
+            logger.debug(f"Tenant name not read: {e}")
+            rows = []
+        for t in rows:
+            if (t.get('tenantId') or '').lower() == self.tenant_id.lower():
+                return {"id": t['tenantId'], "name": t.get('displayName'), "domain": t.get('defaultDomain')}
+        return {"id": self.tenant_id, "name": None, "domain": None}
 
 
 class AssignmentCollector:
@@ -970,6 +990,7 @@ class Scanner:
         root = (mgs or subs)[0]  # the scanned scope; its name is the display name when Azure gave one
         name = root.name if ScopeParser._GUID_RE.match(ref.name) else ref.name
         result = ScanResult(ref.path, name, depth, timestamp, [], pim_skipped=self.pim is None)
+        result.tenant = getattr(self.hierarchy, "tenant", lambda: None)()
         sub_names = {s.subscription_id.lower(): s.name for s in subs}
         mg_names = {m.scope_path.rsplit('/', 1)[-1].lower(): m.name for m in mgs}
         scopes = mgs + ([] if depth == ARAConfig.DEPTH_MANAGEMENT_GROUPS else subs)
@@ -1083,7 +1104,9 @@ class OutputHandler(ABC):
         pass
 
     def file_name(self, results: ScanResult) -> str:
-        safe = re.sub(r'[^A-Za-z0-9_-]', '_', results.scope_name)
+        t = results.tenant or {}
+        label = (t.get("domain") or "").split(".")[0] or t.get("name") or ""
+        safe = re.sub(r'[^A-Za-z0-9_-]', '_', (label + "_" if label else "") + results.scope_name)
         partial = "" if results.complete else ".partial"
         return f"role_assignments_{safe}{partial}.{self.extension}"
 
@@ -1242,6 +1265,8 @@ h1, h2 { font-weight: 600; line-height: 1.15; text-wrap: balance; overflow-wrap:
 
 .top { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: end; gap: var(--space-md) var(--space-xl); margin-bottom: var(--space-lg); }
 .top h1 { font-size: var(--text-xl); }
+.tenant { font-size: var(--text-sm); overflow-wrap: break-word; }
+.tenant .domain { color: var(--color-muted); margin-inline-start: var(--space-xs); }
 .scope { font-size: var(--text-lg); overflow-wrap: break-word; }
 .facts { margin-inline-start: auto; display: flex; flex-wrap: wrap; gap: var(--space-xs) var(--space-md); color: var(--color-muted); font-size: var(--text-sm); }
 .facts p + p { border-left: 1px solid var(--color-rule); padding-left: var(--space-md); }
@@ -1374,7 +1399,12 @@ document.addEventListener("DOMContentLoaded", () => {
   // Heading
   const scopeName = report.scope_name;
   $("scope").textContent = scopeName;
-  document.title = "ARA, " + scopeName;
+  const tenant = meta.tenant;
+  if (tenant) {
+    $("tenant").append(el("span", null, tenant.name || tenant.id));
+    if (tenant.name && tenant.domain) $("tenant").append(el("span", "domain", tenant.domain));
+  }
+  document.title = "ARA " + (tenant && tenant.name ? tenant.name + " " : "") + scopeName;
   const time = el("time", null, when(meta.scan_timestamp, stamp));
   time.dateTime = meta.scan_timestamp;
   $("scanned").append("Scanned ", time);
@@ -1609,6 +1639,7 @@ document.addEventListener("DOMContentLoaded", () => {
   <header class="top">
     <div>
       <h1>ARA</h1>
+      <p class="tenant" id="tenant"></p>
       <p class="scope" id="scope"></p>
     </div>
     <div class="facts">
@@ -1692,6 +1723,9 @@ class ConsoleSummary:
     """Prints the scan outcome: counts, roles, gaps and written files."""
 
     def print(self, results: ScanResult, paths: List[str]) -> None:
+        t = results.tenant
+        if t:
+            print("Tenant: " + (f"{t['name']} ({t['domain']})" if t['name'] and t['domain'] else t['name'] or t['id']))
         print(f"Found {len(results.assignments)} role assignments in "
                    f"{results.management_groups_scanned} management groups and "
                    f"{results.subscriptions_scanned} subscriptions.")

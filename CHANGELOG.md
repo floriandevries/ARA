@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - When PIM refuses only one of its two lists on a scope, the list that was readable is kept; the scope is still listed in `pim_unavailable_scopes`.
 
 ### Added
+- Tenant name and default domain in the report heading, the JSON metadata (`tenant`), the console summary and the file name.
 - Self-contained HTML report for every scan, with search, filters, side panels, shareable views, CSV download, themes and print layout.
 - Pagination on every list call.
 - Tracking of failed scopes, with retries on 429, 5xx and connection errors.
