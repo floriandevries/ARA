@@ -47,11 +47,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-__version__ = "2.1.0"
+__version__ = "3.0.0"
 __author__ = "fjdev"
 
 
@@ -528,25 +528,65 @@ class Scope:
 
 @dataclass
 class ScanResult:
-    """Results container for role assignment scan."""
-    organization: str
+    """Outcome of one scan: the assignments plus what was and was not covered."""
     scope: str
-    scan_timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
-    total_scopes_scanned: int = 0
-    total_assignments_found: int = 0
-    assignments: List[RoleAssignment] = field(default_factory=list)
-    scanned_scopes: List[Scope] = field(default_factory=list)
+    scope_name: str
+    depth: str
+    scan_timestamp: str  # UTC, YYYY-MM-DDTHH:MM:SSZ
+    assignments: List[RoleAssignment]
+    failed_scopes: List[Dict[str, str]] = field(default_factory=list)  # {"scope", "error"}
+    pim_skipped: bool = False
+    pim_unavailable_scopes: List[str] = field(default_factory=list)
+    names: str = "unavailable"
+    management_groups_scanned: int = 0
+    subscriptions_scanned: int = 0
     filters_applied: Dict[str, Any] = field(default_factory=dict)
-    
-    def add_assignment(self, assignment: RoleAssignment):
-        """Add a role assignment to results."""
-        self.assignments.append(assignment)
-        self.total_assignments_found += 1
-    
-    def add_scanned_scope(self, scope: Scope):
-        """Add a scanned scope to results."""
-        self.scanned_scopes.append(scope)
-        self.total_scopes_scanned += 1
+    assignments_before_filters: int = 0
+    stopped: bool = False
+    interrupted: bool = False
+    filters_not_applied: bool = False
+
+    @property
+    def complete(self) -> bool:
+        return not (self.failed_scopes or self.stopped or self.interrupted or self.filters_not_applied)
+
+    @property
+    def pim_status(self) -> str:
+        if self.pim_skipped:
+            return "skipped"
+        if not self.pim_unavailable_scopes:
+            return "included"
+        if len(self.pim_unavailable_scopes) >= self.management_groups_scanned + self.subscriptions_scanned:
+            return "unavailable"
+        return "partial"
+
+    @property
+    def scopes_with_assignments(self) -> int:
+        return len({a.scope.lower() for a in self.assignments})
+
+    def to_dict(self) -> Dict:
+        return {
+            "metadata": {
+                "tool": "ARA",
+                "version": __version__,
+                "schema_version": 3,
+                "scan_timestamp": self.scan_timestamp,
+                "scope": self.scope,
+                "depth": self.depth,
+                "complete": self.complete,
+                "failed_scopes": self.failed_scopes,
+                "pim": self.pim_status,
+                "pim_unavailable_scopes": self.pim_unavailable_scopes,
+                "names": self.names,
+                "filters_applied": self.filters_applied,
+                "management_groups_scanned": self.management_groups_scanned,
+                "subscriptions_scanned": self.subscriptions_scanned,
+                "scopes_with_assignments": self.scopes_with_assignments,
+                "total_assignments_found": len(self.assignments),
+                "assignments_before_filters": self.assignments_before_filters,
+            },
+            "role_assignments": [asdict(a) for a in self.assignments],
+        }
 
 
 # Authentication System
@@ -1002,6 +1042,75 @@ class AssignmentBuilder:
             logger.warning(f"Skipping assignment {item.get('id') or props.get('scope')}: {e}")
 
 
+class Scanner:
+    """Walks the management groups and subscriptions under a scope and collects their assignments."""
+
+    def __init__(self, hierarchy: HierarchyClient, collector: AssignmentCollector,
+                 pim: Optional[PIMCollector], show_progress: bool = True):
+        self.hierarchy = hierarchy
+        self.collector = collector
+        self.pim = pim  # None means --skip-pim
+        self.show_progress = show_progress
+
+    def resolve(self, ref: ScopeRef) -> ScopeRef:
+        """A bare GUID is a subscription, or a management group when no such subscription exists."""
+        if ref.kind != 'guid':
+            return ref
+        try:
+            self.hierarchy.subscription(ref.name)
+            return ScopeRef(ref.path, 'subscription', ref.name)
+        except APIError as e:
+            if e.status != 404:
+                raise
+            return ScopeRef(f"/providers/Microsoft.Management/managementGroups/{ref.name}", 'management-group', ref.name)
+
+    def scan(self, ref: ScopeRef, depth: str, resource_types: Optional[List[str]] = None) -> ScanResult:
+        """Errors reading the root scope are raised; after that, a ScanResult is always returned."""
+        timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        if ref.kind == 'management-group':
+            mgs, subs = self.hierarchy.management_group_tree(ref.name)
+        else:
+            mgs, subs = [], [self.hierarchy.subscription(ref.name)]
+        result = ScanResult(ref.path, ref.name, depth, timestamp, [], pim_skipped=self.pim is None)
+        sub_names = {s.subscription_id.lower(): s.name for s in subs}
+        scopes = mgs + ([] if depth == ARAConfig.DEPTH_MANAGEMENT_GROUPS else subs)
+        try:
+            with ProgressTracker(total=len(scopes), desc="Scanning scopes", disable=not self.show_progress) as progress:
+                for scope in scopes:
+                    try:
+                        self._scan_one(scope, depth, resource_types, sub_names, result)
+                    except APIError as e:
+                        result.failed_scopes.append({"scope": scope.scope_path, "error": str(e)})
+                    progress.update(1)
+        except AuthenticationError as e:
+            logger.error(f"Scan stopped: {e}")
+            result.stopped = True
+        except KeyboardInterrupt:
+            result.interrupted = True
+        result.assignments_before_filters = len(result.assignments)
+        return result
+
+    def _scan_one(self, scope: Scope, depth: str, resource_types: Optional[List[str]],
+                  sub_names: Dict[str, str], result: ScanResult) -> None:
+        is_mg = scope.scope_type == 'Management Group'
+        role_names = self.collector.role_names(scope.scope_path)
+        rows = self.collector.for_management_group(scope) if is_mg else self.collector.for_subscription(scope)
+        active = eligible = None  # type: Optional[List[Dict]]
+        if self.pim:
+            try:
+                eligible, active = self.pim.eligible(scope), self.pim.active(scope)
+            except PIMUnavailable:
+                if not result.pim_unavailable_scopes:
+                    logger.warning("PIM data is not readable with this account; affected assignments get the type 'Active'.")
+                result.pim_unavailable_scopes.append(scope.scope_path)
+        built = AssignmentBuilder(role_names, sub_names).build(rows, active, eligible)
+        result.assignments.extend(a for a in built if DepthFilter.keep(Scope.from_path(a.scope), depth, resource_types))
+        if is_mg:
+            result.management_groups_scanned += 1
+        else:
+            result.subscriptions_scanned += 1
+
+
 class GraphAPIClient:
     """Client for Microsoft Graph API operations."""
     
@@ -1115,8 +1224,8 @@ class SummaryOutputHandler(OutputHandler):
     def generate(self, results: ScanResult, **kwargs) -> None:
         """Generate detailed summary output."""
         safe_print("\n" + "="*ARAConfig.SEPARATOR_LENGTH)
-        safe_print(f"📋 SUMMARY: Found {results.total_assignments_found} role assignments "
-                  f"across {results.total_scopes_scanned} scopes")
+        safe_print(f"📋 SUMMARY: Found {len(results.assignments)} role assignments "
+                  f"across {results.management_groups_scanned + results.subscriptions_scanned} scopes")
         safe_print("="*ARAConfig.SEPARATOR_LENGTH)
         
         if not results.assignments:
@@ -1178,48 +1287,7 @@ class JSONOutputHandler(OutputHandler):
     
     def _build_json_structure(self, results: ScanResult) -> Dict:
         """Build JSON output structure."""
-        metadata = {
-            "tool": "Azure Role Assignment Exporter (ARA)",
-            "version": __version__,
-            "scan_timestamp": results.scan_timestamp,
-            "scope": results.scope,
-            "total_scopes_scanned": results.total_scopes_scanned,
-            "total_assignments_found": results.total_assignments_found
-        }
-        
-        # Add filter information if filters were applied
-        if results.filters_applied:
-            metadata["filters_applied"] = results.filters_applied
-        
-        return {
-            "metadata": metadata,
-            "scopes_scanned": [
-                {
-                    "scope_path": scope.scope_path,
-                    "name": scope.name,
-                    "type": scope.scope_type
-                }
-                for scope in results.scanned_scopes
-            ],
-            "role_assignments": [
-                {
-                    "principal_id": assignment.principal_id,
-                    "principal_name": assignment.principal_name,
-                    "principal_type": assignment.principal_type,
-                    "role_name": assignment.role_name,
-                    "role_id": assignment.role_id,
-                    "scope": assignment.scope,
-                    "scope_name": assignment.scope_name,
-                    "scope_type": assignment.scope_type,
-                    "resource_type": assignment.resource_type,
-                    "assignment_type": assignment.assignment_type,
-                    "start_date_time": assignment.start_date_time,
-                    "end_date_time": assignment.end_date_time
-                }
-                for assignment in results.assignments
-            ]
-        }
-
+        return results.to_dict()
 
 class CSVOutputHandler(OutputHandler):
     """Generate CSV output."""
@@ -1296,159 +1364,16 @@ class ARAApplication:
             
             # Initialize API clients with rate limiting
             api_client = AzureAPIClient(token, api_delay=args.api_delay)
-            api_client.get(api_client.url("/subscriptions"), {"api-version": ARAConfig.AZURE_API_VERSION})
-            
-            # Initialize basic clients
-            hierarchy = HierarchyClient(api_client)
-            ra_client = AssignmentCollector(api_client)
-            pim_client = PIMCollector(api_client)
-            graph_client = GraphAPIClient()  # Gets its own Graph token
-            
-            # Normalize scope - support multiple formats for both MG and subscriptions
-            scope = args.scope
-            scope_type = None  # Will be 'ManagementGroup' or 'Subscription'
-            
-            if not scope.startswith('/'):
-                # Detect if it's a subscription GUID format (8-4-4-4-12 hex pattern)
-                import re
-                guid_pattern = r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-                
-                if re.match(guid_pattern, scope, re.IGNORECASE):
-                    # It's a subscription GUID
-                    scope = f"/subscriptions/{scope}"
-                    scope_type = 'Subscription'
-                elif scope.startswith('subscriptions/'):
-                    # Short format: subscriptions/{guid}
-                    scope = f"/{scope}"
-                    scope_type = 'Subscription'
-                elif '/' not in scope:
-                    # Just an ID - assume it's a management group
-                    scope = f"/providers/Microsoft.Management/managementGroups/{scope}"
-                    scope_type = 'ManagementGroup'
-                elif scope.startswith('managementGroups/'):
-                    # Short format: managementGroups/my-mg
-                    scope = f"/providers/Microsoft.Management/{scope}"
-                    scope_type = 'ManagementGroup'
-                else:
-                    raise ValidationError(
-                        f"Invalid scope format: {args.scope}\n"
-                        f"Supported formats:\n"
-                        f"  Management Group:\n"
-                        f"    - ID: my-mg\n"
-                        f"    - Short: managementGroups/my-mg\n"
-                        f"    - Full: /providers/Microsoft.Management/managementGroups/my-mg\n"
-                        f"  Subscription:\n"
-                        f"    - GUID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx\n"
-                        f"    - Short: subscriptions/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx\n"
-                        f"    - Full: /subscriptions/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-                    )
-            else:
-                # Full path provided - detect type
-                if '/subscriptions/' in scope:
-                    scope_type = 'Subscription'
-                elif '/managementGroups/' in scope:
-                    scope_type = 'ManagementGroup'
-                else:
-                    raise ValidationError(
-                        f"Scope must be a management group or subscription. Got: {args.scope}"
-                    )
-            
-            # Validate depth based on scope type
-            if scope_type == 'Subscription':
-                # For subscription scope, auto-adjust default depth
-                if args.depth == ARAConfig.DEFAULT_DEPTH:  # management-groups is default
-                    logger.info(f"ℹ️  Auto-adjusting depth from '{args.depth}' to 'resource-groups' for subscription scope")
-                    args.depth = ARAConfig.DEPTH_RESOURCE_GROUPS
-                elif args.depth == ARAConfig.DEPTH_MANAGEMENT_GROUPS:
-                    raise ValidationError(
-                        f"Invalid depth '{args.depth}' for subscription scope.\n"
-                        f"Subscription scopes cannot scan management groups.\n"
-                        f"Valid depths: resource-groups, resources"
-                    )
-                elif args.depth == ARAConfig.DEPTH_SUBSCRIPTIONS:
-                    raise ValidationError(
-                        f"Invalid depth '{args.depth}' for subscription scope.\n"
-                        f"The scope is already a subscription. Use 'resource-groups' or 'resources' to scan deeper,\n"
-                        f"or omit --depth to scan only the subscription itself."
-                    )
-            
-            # Initialize assignment filter
             assignment_filter = AssignmentFilter(args)
-            if assignment_filter.has_filters():
-                logger.info("📌 Active Filters:")
-                for key, value in assignment_filter.get_summary().items():
-                    logger.info(f"   {key}: {value}")
-                logger.info("")
-            
-            # Get scopes to scan based on scope type
-            if scope_type == 'ManagementGroup':
-                mg_id = scope.rstrip('/').split('/')[-1]
-                logger.info(f"📂 Management Group ID: {mg_id}")
-                logger.info(f"🎯 Scan Depth: {args.depth}")
-                
-                # Get all scopes in hierarchy
-                logger.info("\n🔍 Discovering child management groups and subscriptions...")
-                mgs, subs = hierarchy.management_group_tree(mg_id)
-                all_scopes = mgs + subs
-                logger.info(f"✅ Found {len(all_scopes)} scope(s) to process\n")
-                
-                # Scan each scope for role assignments
-                results = ScanResult(
-                    organization=mg_id,
-                    scope=scope,
-                    filters_applied=assignment_filter.get_summary()
-                )
-            else:  # Subscription scope
-                subscription_id = scope.split('/')[-1]
-                
-                # Get subscription display name
-                subscription_name = hierarchy.subscription(subscription_id).name
-                
-                logger.info(f"📂 Subscription: {subscription_name}")
-                logger.info(f"   ID: {subscription_id}")
-                logger.info(f"🎯 Scan Depth: {args.depth}")
-                
-                # Create a single-scope list with just this subscription (with display name)
-                logger.info("\n🔍 Scanning subscription...")
-                subscription_scope = Scope(
-                    scope_path=scope,
-                    name=subscription_name,
-                    scope_type='Subscription'
-                )
-                all_scopes = [subscription_scope]
-                logger.info(f"✅ Ready to scan\n")
-                
-                # Scan the subscription
-                results = ScanResult(
-                    organization=subscription_name,
-                    scope=scope,
-                    filters_applied=assignment_filter.get_summary()
-                )
-            
-            # Initialize progress tracker
-            # Disable progress if debug mode is on or if explicitly disabled
-            show_progress = not (args.debug or args.no_progress)
-            
-            with ProgressTracker(total=len(all_scopes), desc="Scanning scopes", disable=not show_progress) as progress:
-                for scope in all_scopes:
-                    # If depth is management-groups only, skip subscriptions entirely
-                    if args.depth == ARAConfig.DEPTH_MANAGEMENT_GROUPS and scope.scope_type == 'Subscription':
-                        progress.update(1)
-                        continue
-                    
-                    results.add_scanned_scope(scope)
-                    indent = ""
-                    logger.info(f"{indent}🔍 Scanning: {scope.name} ({scope.scope_type})")
-                    
-                    # Get direct assignments for current scope
-                    self._scan_scope_assignments(scope, results, ra_client, pim_client, graph_client, indent, assignment_filter, args)
-                    
-                    # Update progress after processing each scope
-                    progress.update(1)
-            
-            logger.info(f"\n✅ Scan complete: {results.total_assignments_found} assignments "
-                       f"across {results.total_scopes_scanned} scopes")
-            
+            # shortcut: interim wiring so the CLI still scans; Task 8 rewrites run()
+            scanner = Scanner(HierarchyClient(api_client), AssignmentCollector(api_client),
+                              None if args.skip_pim else PIMCollector(api_client),
+                              show_progress=not (args.debug or args.no_progress))
+            ref = scanner.resolve(ScopeParser.parse(args.scope))
+            results = scanner.scan(ref, ScopeParser.resolve_depth(ref.kind, args.depth), args.resource_types)
+            results.assignments = assignment_filter.apply(results.assignments)
+            results.filters_applied = assignment_filter.get_summary()
+
             # Generate outputs
             if args.format == 'json':
                 self.output_handlers['json'].generate(results)
@@ -1473,225 +1398,6 @@ class ARAApplication:
                 import traceback
                 traceback.print_exc()
             return ARAConfig.EXIT_CODE_ERROR
-    
-    def _scan_scope_assignments(self, scope: Scope, results: ScanResult, 
-                                ra_client: AssignmentCollector,
-                                pim_client: PIMCollector,
-                                graph_client: GraphAPIClient, 
-                                indent: str,
-                                assignment_filter: Optional['AssignmentFilter'] = None,
-                                args=None) -> None:
-        """Scan role assignments (both active and eligible via PIM) for a specific scope.
-        
-        Args:
-            scope: Scope to scan
-            results: Results object to add assignments to
-            ra_client: Assignment collector (standard RBAC and role names)
-            pim_client: PIM client (eligible and time-bound assignments)
-            graph_client: Graph API client
-            indent: Logging indentation
-            assignment_filter: Optional filter to apply to assignments
-            args: Command-line arguments (for --skip-pim flag)
-        """
-        all_assignments = []
-        active_permanent_count = 0
-        active_timebound_count = 0
-        eligible_permanent_count = 0
-        eligible_timebound_count = 0
-        
-        # Determine if we should skip PIM for this scope
-        skip_pim = getattr(args, 'skip_pim', False) if args else False
-        
-        # PIM APIs only work for management groups, subscriptions, and resource groups (not individual resources)
-        pim_supported_scope = scope.scope_type in ('Management Group', 'Subscription', 'Resource Group')
-        
-        # Track assignments by unique key (principal_id + role_id + scope) to avoid duplicates
-        seen_assignments = set()
-        role_names = ra_client.role_names(scope.scope_path)
-        role_name_of = lambda role_def_id: role_names.get(role_def_id.rsplit('/', 1)[-1].lower(), 'Unknown')
-        
-        if not skip_pim and pim_supported_scope:
-            # Try to fetch PIM data (eligible and time-bound active assignments)
-            
-            # Fetch eligible assignments (PIM)
-            try:
-                eligible_data = pim_client.eligible(scope)
-                
-                for eligibility_data in eligible_data:
-                    props = eligibility_data.get('properties', {})
-                    principal_id = props.get('principalId', '')
-                    principal_type = props.get('principalType', 'Unknown')
-                    role_def_id = props.get('roleDefinitionId', '')
-                    start_date = props.get('startDateTime')
-                    end_date = props.get('endDateTime')
-                    
-                    # Create unique key for deduplication
-                    assignment_key = (principal_id, role_def_id, scope.scope_path.lower())
-                    if assignment_key in seen_assignments:
-                        continue
-                    seen_assignments.add(assignment_key)
-                    
-                    # Determine if eligible assignment is permanent or time-bound
-                    assignment_type = "Eligible time-bound" if end_date else "Eligible permanent"
-                    
-                    # Get role name
-                    role_name = role_name_of(role_def_id)
-                    
-                    # Get principal name
-                    try:
-                        principal_name = graph_client.get_principal_display_name(principal_id, principal_type)
-                    except Exception:
-                        principal_name = principal_id
-                    
-                    # Create role assignment
-                    role_assignment = RoleAssignment(
-                        principal_id=principal_id,
-                        principal_name=principal_name,
-                        principal_type=principal_type,
-                        role_name=role_name,
-                        role_id=role_def_id,
-                        scope=scope.scope_path,
-                        scope_name=scope.name,
-                        scope_type=scope.scope_type,
-                        resource_type=scope.resource_type,
-                        assignment_type=assignment_type,
-                        start_date_time=start_date,
-                        end_date_time=end_date
-                    )
-                    all_assignments.append(role_assignment)
-                    
-                    if assignment_type == "Eligible permanent":
-                        eligible_permanent_count += 1
-                    else:
-                        eligible_timebound_count += 1
-                        
-            except Exception as e:
-                logger.warning(f"⚠️  Could not fetch PIM eligible assignments for {scope.name}: {e}")
-                logger.debug(f"PIM eligible assignments API error details: {e}", exc_info=True)
-            
-            # Fetch time-bound active assignments (PIM activated)
-            try:
-                timebound_data = pim_client.active(scope)
-                
-                for timebound_assignment in timebound_data:
-                    props = timebound_assignment.get('properties', {})
-                    principal_id = props.get('principalId', '')
-                    principal_type = props.get('principalType', 'Unknown')
-                    role_def_id = props.get('roleDefinitionId', '')
-                    start_date = props.get('startDateTime')
-                    end_date = props.get('endDateTime')
-                    
-                    # Create unique key for deduplication
-                    assignment_key = (principal_id, role_def_id, scope.scope_path.lower())
-                    if assignment_key in seen_assignments:
-                        logger.debug(f"Skipping duplicate time-bound active assignment: {principal_id} / {role_def_id}")
-                        continue
-                    seen_assignments.add(assignment_key)
-                    
-                    # Get role name
-                    role_name = role_name_of(role_def_id)
-                    
-                    # Get principal name
-                    try:
-                        principal_name = graph_client.get_principal_display_name(principal_id, principal_type)
-                    except Exception:
-                        principal_name = principal_id
-                    
-                    # Determine if active assignment is permanent or time-bound
-                    # Per Microsoft docs: check endDateTime to distinguish permanent vs time-bound
-                    # Service principals with no endDateTime are "Active permanent" (not eligible-based)
-                    assignment_type = "Active time-bound" if end_date else "Active permanent"
-                    
-                    # Create role assignment
-                    role_assignment = RoleAssignment(
-                        principal_id=principal_id,
-                        principal_name=principal_name,
-                        principal_type=principal_type,
-                        role_name=role_name,
-                        role_id=role_def_id,
-                        scope=scope.scope_path,
-                        scope_name=scope.name,
-                        scope_type=scope.scope_type,
-                        resource_type=scope.resource_type,
-                        assignment_type=assignment_type,
-                        start_date_time=start_date,
-                        end_date_time=end_date
-                    )
-                    all_assignments.append(role_assignment)
-                    
-                    if assignment_type == "Active permanent":
-                        active_permanent_count += 1
-                    else:
-                        active_timebound_count += 1
-                    
-            except Exception as e:
-                logger.warning(f"⚠️  Could not fetch PIM time-bound active assignments for {scope.name}: {e}")
-                logger.debug(f"PIM time-bound active assignments API error details: {e}", exc_info=True)
-        
-        # Fetch standard permanent active role assignments
-        rows = (ra_client.for_management_group(scope) if scope.scope_type == 'Management Group'
-                else ra_client.for_subscription(scope))
-        assignments_data = [r for r in rows if r.get('properties', {}).get('scope', '').lower() == scope.scope_path.lower()]
-        
-        for assignment_data in assignments_data:
-            props = assignment_data.get('properties', {})
-            principal_id = props.get('principalId', '')
-            principal_type = props.get('principalType', 'Unknown')
-            role_def_id = props.get('roleDefinitionId', '')
-            
-            # Create unique key for deduplication (avoid counting PIM-activated assignments twice)
-            assignment_key = (principal_id, role_def_id, scope.scope_path.lower())
-            if assignment_key in seen_assignments:
-                logger.debug(f"Skipping duplicate standard assignment: {principal_id} / {role_def_id}")
-                continue
-            seen_assignments.add(assignment_key)
-            
-            # Get role name
-            role_name = role_name_of(role_def_id)
-            
-            # Get principal name
-            try:
-                principal_name = graph_client.get_principal_display_name(principal_id, principal_type)
-            except Exception:
-                principal_name = principal_id
-            
-            # Create role assignment (Active permanent - standard RBAC)
-            role_assignment = RoleAssignment(
-                principal_id=principal_id,
-                principal_name=principal_name,
-                principal_type=principal_type,
-                role_name=role_name,
-                role_id=role_def_id,
-                scope=scope.scope_path,
-                scope_name=scope.name,
-                scope_type=scope.scope_type,
-                resource_type=scope.resource_type,
-                assignment_type="Active permanent"
-            )
-            all_assignments.append(role_assignment)
-            active_permanent_count += 1
-        
-        # Log findings
-        if all_assignments:
-            # Apply filters if configured
-            if assignment_filter and assignment_filter.has_filters():
-                filtered_assignments = assignment_filter.apply(all_assignments)
-                logger.info(f"{indent}  📋 Found {len(all_assignments)} assignment(s): "
-                           f"{active_permanent_count} active permanent, {active_timebound_count} active time-bound, "
-                           f"{eligible_permanent_count} eligible permanent, {eligible_timebound_count} eligible time-bound "
-                           f"({len(filtered_assignments)} after filtering)")
-            else:
-                filtered_assignments = all_assignments
-                logger.info(f"{indent}  📋 Found {len(filtered_assignments)} assignment(s): "
-                           f"{active_permanent_count} active permanent, {active_timebound_count} active time-bound, "
-                           f"{eligible_permanent_count} eligible permanent, {eligible_timebound_count} eligible time-bound")
-            
-            # Add filtered assignments to results
-            for assignment in filtered_assignments:
-                results.add_assignment(assignment)
-        else:
-            logger.info(f"{indent}  ⚪ No assignments")
-
 
 
 def parse_arguments() -> argparse.Namespace:

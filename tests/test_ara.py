@@ -247,5 +247,91 @@ class PIMCollectorTest(unittest.TestCase):
         api = FakeAPI({"roleEligibilityScheduleInstances": [instance(S + "/resourceGroups/rg"), instance(MG)]})
         self.assertEqual(len(ara.PIMCollector(api).eligible(ara.Scope.from_path(S))), 1)
 
+class FakeHierarchy:
+    def __init__(self, mgs=(), subs=(), error=None, subscription_error=None):
+        self.mgs, self.subs, self.error, self.subscription_error = list(mgs), list(subs), error, subscription_error
+    def management_group_tree(self, mg_id):
+        if self.error:
+            raise self.error
+        return self.mgs, self.subs
+    def subscription(self, subscription_id):
+        if self.subscription_error:
+            raise self.subscription_error
+        return ara.Scope.from_path("/subscriptions/" + subscription_id)
+
+class FakeCollector:
+    """Returns rows per scope path; fail maps a scope path to the exception its listing raises."""
+    def __init__(self, rows_by_scope, fail=None):
+        self.rows, self.fail = rows_by_scope, fail or {}
+    def _rows(self, scope):
+        if scope.scope_path in self.fail:
+            raise self.fail[scope.scope_path]
+        return self.rows.get(scope.scope_path, [])
+    for_management_group = for_subscription = _rows
+    def role_names(self, scope_path):
+        return {}
+
+class FakePIM:
+    """No PIM instances; scopes listed in unavailable raise PIMUnavailable."""
+    def __init__(self, unavailable=()):
+        self.unavailable = unavailable
+    def eligible(self, scope):
+        if scope.scope_path in self.unavailable:
+            raise ara.PIMUnavailable("forbidden")
+        return []
+    active = eligible
+
+class ScannerTest(unittest.TestCase):
+    S1, S2 = "/subscriptions/" + G, "/subscriptions/" + G[:-1] + "6"
+    def scanner(self, fail=None, pim="default", subs=None):
+        mg = ara.Scope.from_path(MG); subs = subs if subs is not None else [ara.Scope.from_path(self.S1), ara.Scope.from_path(self.S2)]
+        rows = {MG: [row(MG, id_="m")], self.S1: [row(self.S1, id_="a"), row(self.S1 + "/resourceGroups/rg", id_="b")], self.S2: [row(self.S2, id_="c")]}
+        return ara.Scanner(FakeHierarchy([mg], subs), FakeCollector(rows, fail or {}),
+                           FakePIM() if pim == "default" else pim, show_progress=False)
+    def ref(self): return ara.ScopeParser.parse(MG)
+    def test_depth_management_groups_skips_subscriptions(self):
+        r = self.scanner().scan(self.ref(), "management-groups")
+        self.assertEqual((len(r.assignments), r.subscriptions_scanned, r.management_groups_scanned), (1, 0, 1))
+    def test_depth_resource_groups(self):
+        r = self.scanner().scan(self.ref(), "resource-groups")
+        self.assertEqual((len(r.assignments), r.subscriptions_scanned, r.complete, r.scopes_with_assignments), (4, 2, True, 4))
+    def test_failed_scope_is_recorded_and_scan_continues(self):
+        r = self.scanner(fail={self.S1: ara.APIError("boom", status=500)}).scan(self.ref(), "subscriptions")
+        self.assertEqual([f["scope"] for f in r.failed_scopes], [self.S1])
+        self.assertEqual((len(r.assignments), r.complete), (2, False))
+    def test_authentication_error_stops_scan(self):
+        r = self.scanner(fail={self.S1: ara.AuthenticationError("expired")}).scan(self.ref(), "subscriptions")
+        self.assertTrue(r.stopped); self.assertFalse(r.complete); self.assertEqual(len(r.assignments), 1)
+    def test_keyboard_interrupt_returns_partial(self):
+        r = self.scanner(fail={self.S2: KeyboardInterrupt()}).scan(self.ref(), "subscriptions")
+        self.assertTrue(r.interrupted); self.assertEqual(len(r.assignments), 2)
+    def test_pim_states(self):
+        self.assertEqual(self.scanner().scan(self.ref(), "subscriptions").pim_status, "included")
+        self.assertEqual(self.scanner(pim=None).scan(self.ref(), "subscriptions").pim_status, "skipped")
+        r = self.scanner(pim=FakePIM(unavailable=(self.S1,))).scan(self.ref(), "subscriptions")
+        self.assertEqual((r.pim_status, r.pim_unavailable_scopes, r.complete), ("partial", [self.S1], True))
+        r = self.scanner(pim=FakePIM(unavailable=(MG, self.S1, self.S2))).scan(self.ref(), "subscriptions")
+        self.assertEqual(r.pim_status, "unavailable")
+    def test_pim_unavailable_warns_once(self):
+        ara.logger.disabled = False
+        try:
+            with self.assertLogs(ara.logger, level="WARNING") as logs:
+                self.scanner(pim=FakePIM(unavailable=(self.S1, self.S2))).scan(self.ref(), "subscriptions")
+        finally:
+            ara.logger.disabled = True
+        self.assertEqual(len(logs.records), 1)
+    def test_root_failure_is_raised(self):
+        s = ara.Scanner(FakeHierarchy(error=ara.APIError("nope", status=403)), FakeCollector({}, {}), None, show_progress=False)
+        with self.assertRaises(ara.APIError): s.scan(self.ref(), "subscriptions")
+    def test_bare_guid_falls_back_to_management_group(self):
+        s = ara.Scanner(FakeHierarchy([], [], subscription_error=ara.APIError("nf", status=404)), FakeCollector({}, {}), None, show_progress=False)
+        self.assertEqual(s.resolve(ara.ScopeParser.parse(G)).kind, "management-group")
+    def test_to_dict_metadata(self):
+        m = self.scanner().scan(self.ref(), "subscriptions").to_dict()["metadata"]
+        self.assertEqual((m["tool"], m["version"], m["schema_version"], m["complete"], m["pim"], m["depth"]),
+                         ("ARA", "3.0.0", 3, True, "included", "subscriptions"))
+        self.assertRegex(m["scan_timestamp"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        for gone in ("total_scopes_scanned",): self.assertNotIn(gone, m)
+
 if __name__ == "__main__":
     unittest.main()
