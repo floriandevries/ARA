@@ -18,7 +18,7 @@ Requirements:
 
 Author: fjdev
 License: MIT
-Version: 3.0.0
+Version: 4.0.0
 """
 
 # Standard library imports
@@ -43,7 +43,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-__version__ = "3.0.0"
+__version__ = "4.0.0"
 __author__ = "fjdev"
 
 
@@ -725,7 +725,7 @@ class HttpClient:
             request = urllib.request.Request(url, data=data, method=method, headers={
                 'Authorization': f'Bearer {self.token}',
                 'Content-Type': 'application/json',
-                'User-Agent': 'ARA/3.0.0',
+                'User-Agent': f'ARA/{__version__}',
             })
             retry_after = None
             try:
