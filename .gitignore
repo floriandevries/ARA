@@ -56,3 +56,7 @@ TODO.local.md
 # OS
 .DS_Store
 Thumbs.db
+
+# Report output and brainstorm mockups
+results/*.html
+.superpowers/
