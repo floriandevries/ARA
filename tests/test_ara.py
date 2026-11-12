@@ -222,6 +222,18 @@ class AssignmentBuilderTest(unittest.TestCase):
         out = self.builder().build([row(self.S, id_="a"), row(self.S + "/resourceGroups/rg/providers/Microsoft.Network/virtualNetworks/v/subnets/s", id_="b")], None, None)
         self.assertEqual((out[0].scope_name, out[0].scope_type), ("Prod", "Subscription"))
         self.assertEqual((out[1].scope_name, out[1].resource_type), ("s", "Microsoft.Network/virtualNetworks/subnets"))
+    def test_bad_row_is_skipped_with_warning(self):
+        ara.logger.disabled = False
+        try:
+            with self.assertLogs(ara.logger, level="WARNING") as logs:
+                out = self.builder().build([row(self.S, id_="a"), row("/", id_="bad-row"), row(self.S, id_="b")], None, None)
+        finally:
+            ara.logger.disabled = True
+        self.assertEqual(len(out), 2)
+        self.assertEqual(len(logs.records), 1); self.assertIn("bad-row", logs.output[0])
+    def test_origin_id_matches_ignoring_case(self):
+        out = self.builder().build([row(self.S, id_="/X/RA1")], [instance(self.S, origin="/x/ra1")], None)
+        self.assertEqual(out[0].assignment_type, "Active permanent")
 
 class PIMCollectorTest(unittest.TestCase):
     def test_403_becomes_pim_unavailable(self):

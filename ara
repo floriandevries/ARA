@@ -974,14 +974,14 @@ class AssignmentBuilder:
         for r in rbac_rows:
             inst = by_origin.get(r.get('id', '').lower(), {})
             kind = ('Active time-bound' if inst.get('endDateTime') else 'Active permanent') if inst else 'Active'
-            self._add(out, r.get('properties', {}), inst, kind)
+            self._add(out, r, r.get('properties', {}), inst, kind)
         for e in eligible_instances or []:
             p = e.get('properties', {})
-            self._add(out, p, p, 'Eligible time-bound' if p.get('endDateTime') else 'Eligible permanent')
+            self._add(out, e, p, p, 'Eligible time-bound' if p.get('endDateTime') else 'Eligible permanent')
         return out
 
-    def _add(self, out: List[RoleAssignment], props: Dict, inst: Dict, kind: str) -> None:
-        """props gives principal, role and scope; inst (a schedule instance, or {}) gives names and dates."""
+    def _add(self, out: List[RoleAssignment], item: Dict, props: Dict, inst: Dict, kind: str) -> None:
+        """item is the source row; props gives principal, role and scope; inst (a schedule instance, or {}) gives names and dates."""
         expanded = inst.get('expandedProperties') or {}
         role_id = props.get('roleDefinitionId', '')
         guid = role_id.rsplit('/', 1)[-1]
@@ -989,7 +989,7 @@ class AssignmentBuilder:
             scope = Scope.from_path(props.get('scope', ''))
             name = scope.name
             if scope.scope_type == 'Subscription':
-                name = self.subscription_names.get(scope.subscription_id.lower(), name)
+                name = self.subscription_names.get(scope.subscription_id.lower()) or name
             out.append(RoleAssignment(
                 principal_id=props.get('principalId', ''),
                 principal_name=(expanded.get('principal') or {}).get('displayName') or None,
@@ -999,7 +999,7 @@ class AssignmentBuilder:
                 resource_type=scope.resource_type, assignment_type=kind,
                 start_date_time=inst.get('startDateTime'), end_date_time=inst.get('endDateTime')))
         except ValidationError as e:
-            logger.debug(f"Skipping assignment: {e}")
+            logger.warning(f"Skipping assignment {item.get('id') or props.get('scope')}: {e}")
 
 
 class GraphAPIClient:
