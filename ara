@@ -24,6 +24,7 @@ Version: 3.0.0
 # Standard library imports
 import argparse
 import csv
+import http.client
 import io
 import json
 import logging
@@ -743,7 +744,7 @@ class HttpClient:
                 retry_after = (e.headers or {}).get("Retry-After")
             except json.JSONDecodeError as e:
                 raise APIError(f"Invalid JSON response from {url}: {e}")
-            except OSError as e:  # URLError, socket.timeout, connection resets
+            except (OSError, http.client.HTTPException) as e:  # URLError, socket.timeout, connection resets, truncated bodies
                 error = APIError(f"Network error for {url}: {e}")
             if attempt == ARAConfig.MAX_ATTEMPTS - 1:
                 raise error
@@ -976,6 +977,7 @@ class Scanner:
             logger.error(f"Scan stopped: {e}")
             result.stopped = True
         except KeyboardInterrupt:
+            logger.warning("Interrupted. Writing what was read so far.")
             result.interrupted = True
         result.assignments_before_filters = len(result.assignments)
         return result
@@ -987,9 +989,16 @@ class Scanner:
         rows = self.collector.for_management_group(scope) if is_mg else self.collector.for_subscription(scope)
         active = eligible = None  # type: Optional[List[Dict]]
         if self.pim:
+            refused = False
             try:
-                eligible, active = self.pim.eligible(scope), self.pim.active(scope)
+                eligible = self.pim.eligible(scope)
             except PIMUnavailable:
+                refused = True
+            try:
+                active = self.pim.active(scope)
+            except PIMUnavailable:
+                refused = True
+            if refused:
                 if not result.pim_unavailable_scopes:
                     logger.warning("PIM data is not readable with this account; affected assignments get the type 'Active'.")
                 result.pim_unavailable_scopes.append(scope.scope_path)
@@ -1008,8 +1017,9 @@ class GraphAPIClient(HttpClient):
     @classmethod
     def create(cls, az_token: Callable[[], Optional[str]]) -> Optional['GraphAPIClient']:
         """Token from AZURE_GRAPH_TOKEN, else from az_token(); None when neither gives one."""
-        token = os.environ.get('AZURE_GRAPH_TOKEN') or az_token()
-        return cls(token) if token else None
+        env_token = os.environ.get('AZURE_GRAPH_TOKEN')
+        token = env_token or az_token()
+        return cls(token, refresh_token=None if env_token else az_token) if token else None
 
     def get_by_ids(self, ids: List[str]) -> Dict[str, Dict]:
         """Look up users, groups and service principals; maps lowercased id to the returned object."""
@@ -1026,6 +1036,7 @@ class PrincipalResolver:
 
     def __init__(self, graph: Optional[GraphAPIClient]):
         self.graph = graph
+        self.asked_graph = False  # True once a Graph lookup succeeded
 
     def resolve(self, assignments: List[RoleAssignment]) -> Tuple[List[RoleAssignment], str]:
         """Return the assignments with names filled in, and the names status."""
@@ -1037,6 +1048,7 @@ class PrincipalResolver:
             except ARAError as e:
                 logger.warning(f"Microsoft Graph lookup failed: {e}. Principal names come from PIM only.")
             else:
+                self.asked_graph = True
                 return [self._apply(a, found.get(a.principal_id.lower())) for a in assignments], "resolved"
         named = sum(1 for a in assignments if a.principal_name)
         return assignments, "resolved" if named == len(assignments) else "unavailable" if named == 0 else "partial"
@@ -1362,7 +1374,7 @@ document.addEventListener("DOMContentLoaded", () => {
   time.dateTime = meta.scan_timestamp;
   $("scanned").append("Scanned ", time);
   $("coverage").textContent = plural(meta.management_groups_scanned, "management group", "management groups") + ", " +
-    plural(meta.subscriptions_scanned, "subscription", "subscriptions");
+    plural(meta.subscriptions_scanned, "subscription", "subscriptions") + ", depth " + meta.depth;
   $("state").textContent = meta.complete ? "Scan complete" : "Scan incomplete";
   if (!meta.complete) $("state").className = "risk";
   $("about").textContent = "ARA " + meta.version + ", " + report.descriptor + ". " + report.slogan;
@@ -1371,13 +1383,15 @@ document.addEventListener("DOMContentLoaded", () => {
   const notes = [];
   const failed = meta.failed_scopes.length;
   if (failed) notes.push("The scan is incomplete: " + plural(failed, "scope", "scopes") + " could not be read.");
-  else if (!meta.complete && !report.filters_not_applied) notes.push("The scan is incomplete: it stopped before every scope was read.");
-  if (meta.pim === "skipped") notes.push("PIM was skipped, so every assignment has the type Active.");
-  else if (meta.pim === "partial") notes.push("PIM data could not be read on " + plural(meta.pim_unavailable_scopes.length, "scope", "scopes") + ", so assignments there have the type Active.");
-  else if (meta.pim === "unavailable") notes.push("PIM data could not be read, so every assignment has the type Active.");
+  if (report.stopped) notes.push("The scan stopped before every scope was read.");
+  if (meta.pim === "skipped") notes.push("PIM was skipped: eligible assignments are not listed and every active assignment has the type Active.");
+  else if (meta.pim === "partial") notes.push("PIM data could not be read in full on " + plural(meta.pim_unavailable_scopes.length, "scope", "scopes") + ": eligible assignments there may be missing and active assignments may have the type Active.");
+  else if (meta.pim === "unavailable") notes.push("PIM data could not be read in full: eligible assignments may be missing and active assignments may have the type Active.");
   if (meta.names === "partial") notes.push("Some principal names could not be read; those rows show the principal ID.");
   else if (meta.names === "unavailable") notes.push("Principal names could not be read; rows show the principal ID.");
   if (report.filters_not_applied) notes.push("Filters were not applied because principal names are incomplete; the report shows every assignment found.");
+  const filters = Object.keys(meta.filters_applied);
+  if (filters.length) notes.push("Filters were applied at scan time (" + filters.map((k) => k + ": " + meta.filters_applied[k]).join("; ") + "); the report shows only matching assignments.");
   notes.forEach((n) => $("banner").appendChild(el("p", null, n)));
   $("banner").hidden = notes.length === 0;
 
@@ -1444,7 +1458,7 @@ document.addEventListener("DOMContentLoaded", () => {
     if (state.chips.size) p.set("f", Array.from(state.chips).join(","));
     if (state.open) p.set(state.open.kind, state.open.key);
     const hash = p.toString();
-    history.replaceState(null, "", hash ? "#" + hash : location.pathname + location.search);
+    try { history.replaceState(null, "", hash ? "#" + hash : location.pathname + location.search); } catch (e) { /* view not kept in the address bar */ }
   }
   // The fragment is attacker-controllable: q only fills the search field, f only matches known chip ids,
   // principal and scope are only compared to row values.
@@ -1608,7 +1622,10 @@ document.addEventListener("DOMContentLoaded", () => {
     <button class="btn" id="clear" type="button">Clear filters</button>
   </div>
   <button class="btn more" id="more" type="button" hidden>Show more</button>
-  <footer><p id="about"></p></footer>
+  <footer>
+    <p>Only direct assignments at or below the scanned scope are listed; assignments inherited from above it are not.</p>
+    <p id="about"></p>
+  </footer>
 </div>
 <aside class="panel" id="panel" aria-labelledby="panel-title" inert>
   <div class="panel-head">
@@ -1646,6 +1663,7 @@ class HTMLOutputHandler(OutputHandler):
             "descriptor": ARAConfig.DESCRIPTOR,
             "slogan": ARAConfig.SLOGAN,
             "filters_not_applied": results.filters_not_applied,  # not in metadata, but the banner needs it
+            "stopped": results.stopped or results.interrupted,
         }
         return REPORT_TEMPLATE.replace("/*ARA_DATA*/", self.embed(data))
 
@@ -1666,7 +1684,9 @@ class ConsoleSummary:
             print(f"Names: {results.names}")
         for failed in results.failed_scopes:
             print(f"Failed scope: {failed['scope']}: {failed['error']}")
-        for path in paths:
+        if not results.complete:
+            print("Scan incomplete.")
+        for path in paths[1:] + paths[:1]:  # the report is written first and printed last
             print(f"Written: {path}")
 
 
@@ -1715,6 +1735,13 @@ class ARAApplication:
             logger.error("--principal-name-filter and --exclude-managed-identities need a Microsoft Graph token. "
                          "Run az login or set AZURE_GRAPH_TOKEN.")
             return ARAConfig.EXIT_CODE_ERROR
+        if assignment_filter.needs_graph():
+            try:
+                graph.get_by_ids(["00000000-0000-0000-0000-000000000000"])
+            except ARAError as e:
+                logger.error(f"Microsoft Graph lookup failed: {e}. --principal-name-filter and "
+                             "--exclude-managed-identities need a working Microsoft Graph token.")
+                return ARAConfig.EXIT_CODE_ERROR
 
         scanner = self.scanner_factory(args)
         try:
@@ -1727,8 +1754,9 @@ class ARAApplication:
             logger.error(f"Cannot read {ref.path}: {e}")
             return ARAConfig.EXIT_CODE_ERROR
 
-        assignments, results.names = PrincipalResolver(graph).resolve(results.assignments)
-        if assignment_filter.needs_graph() and results.names != "resolved":
+        resolver = PrincipalResolver(graph)
+        assignments, results.names = resolver.resolve(results.assignments)
+        if assignment_filter.needs_graph() and (results.names != "resolved" or not resolver.asked_graph):
             logger.warning("Principal names are incomplete. Filters were not applied.")
             results.assignments = assignments
             results.filters_not_applied = True
@@ -1736,6 +1764,8 @@ class ARAApplication:
             results.assignments_before_filters = len(assignments)
             results.assignments = assignment_filter.apply(assignments)
             results.filters_applied = assignment_filter.get_summary()
+        if args.resource_types:
+            results.filters_applied['resource_types'] = ', '.join(args.resource_types)
         self.last_result = results
 
         try:

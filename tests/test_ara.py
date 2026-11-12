@@ -1,4 +1,4 @@
-import contextlib, csv, importlib.machinery, importlib.util, io, os, tempfile, json, pathlib, re, socket, sys, unittest, urllib.error, urllib.parse
+import contextlib, csv, http.client, importlib.machinery, importlib.util, io, os, tempfile, json, pathlib, re, socket, sys, unittest, urllib.error, urllib.parse
 sys.dont_write_bytecode = True
 _path = str(pathlib.Path(__file__).resolve().parent.parent / "ara")
 _loader = importlib.machinery.SourceFileLoader("ara", _path)
@@ -72,6 +72,8 @@ class FakeOpener:
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
+        if hasattr(outcome, "read"):
+            return outcome
         return io.BytesIO(json.dumps(outcome).encode())
 
 def http_error(code, headers=None):
@@ -106,6 +108,11 @@ class HttpClientTest(unittest.TestCase):
     def test_401_without_refresh_raises_authentication_error(self):
         c = self.client([http_error(401)])
         with self.assertRaises(ara.AuthenticationError): c.get("https://x")
+    def test_truncated_body_is_retried(self):
+        class Truncated(io.BytesIO):
+            def read(self, *a): raise http.client.IncompleteRead(b"{")
+        c = self.client([Truncated(), {"ok": 1}])
+        self.assertEqual(c.get("https://x"), {"ok": 1}); self.assertEqual(self.sleeps, [2])
     def test_post_sends_json_body(self):
         c = self.client([{"value": []}]); c.request("POST", "https://x", body={"ids": ["a"]})
         self.assertEqual(json.loads(self.opener.requests[0].data), {"ids": ["a"]})
@@ -247,6 +254,11 @@ class PIMCollectorTest(unittest.TestCase):
         S = "/subscriptions/" + G
         api = FakeAPI({"roleEligibilityScheduleInstances": [instance(S + "/resourceGroups/rg"), instance(MG)]})
         self.assertEqual(len(ara.PIMCollector(api).eligible(ara.Scope.from_path(S))), 1)
+    def test_management_group_keeps_exact_scope_rows_only(self):
+        api = FakeAPI({"roleEligibilityScheduleInstances": [instance(MG), instance(MG.upper()), instance(MG + "-parent"),
+                                                            instance("/subscriptions/" + G)]})
+        self.assertEqual(len(ara.PIMCollector(api).eligible(ara.Scope.from_path(MG))), 2)
+        self.assertIn("atScope", api.calls[0])
 
 class FakeHierarchy:
     def __init__(self, mgs=(), subs=(), error=None, subscription_error=None):
@@ -273,14 +285,17 @@ class FakeCollector:
         return {}
 
 class FakePIM:
-    """No PIM instances; scopes listed in unavailable raise PIMUnavailable."""
-    def __init__(self, unavailable=()):
-        self.unavailable = unavailable
+    """Eligible rows per scope path, no active instances; unavailable refuses both lists, active_refused only the active list."""
+    def __init__(self, unavailable=(), eligible_rows=None, active_refused=()):
+        self.unavailable, self.eligible_rows, self.active_refused = unavailable, eligible_rows or {}, active_refused
     def eligible(self, scope):
         if scope.scope_path in self.unavailable:
             raise ara.PIMUnavailable("forbidden")
+        return self.eligible_rows.get(scope.scope_path, [])
+    def active(self, scope):
+        if scope.scope_path in self.unavailable or scope.scope_path in self.active_refused:
+            raise ara.PIMUnavailable("forbidden")
         return []
-    active = eligible
 
 class ScannerTest(unittest.TestCase):
     S1, S2 = "/subscriptions/" + G, "/subscriptions/" + G[:-1] + "6"
@@ -313,6 +328,11 @@ class ScannerTest(unittest.TestCase):
         self.assertEqual((r.pim_status, r.pim_unavailable_scopes, r.complete), ("partial", [self.S1], True))
         r = self.scanner(pim=FakePIM(unavailable=(MG, self.S1, self.S2))).scan(self.ref(), "subscriptions")
         self.assertEqual(r.pim_status, "unavailable")
+    def test_active_refused_keeps_eligible_rows_and_flags_scope(self):
+        pim = FakePIM(eligible_rows={self.S1: [instance(self.S1)]}, active_refused=(self.S1,))
+        r = self.scanner(pim=pim).scan(self.ref(), "subscriptions")
+        self.assertIn("Eligible permanent", [a.assignment_type for a in r.assignments if a.scope == self.S1])
+        self.assertEqual(r.pim_unavailable_scopes, [self.S1])
     def test_pim_unavailable_warns_once(self):
         ara.logger.disabled = False
         try:
@@ -453,6 +473,9 @@ class HTMLReportTest(unittest.TestCase):
         d = self.data(self.html([ra(name=None)]))
         self.assertIsNone(d["role_assignments"][0]["principal_name"])
         self.assertEqual(d["report"]["high_privilege_roles"], ["Owner", "User Access Administrator", "Role Based Access Control Administrator"])
+    def test_report_block_carries_stopped(self):
+        for kw, stopped in (({"stopped": True}, True), ({"interrupted": True}, True), ({}, False)):
+            self.assertEqual(self.data(self.html([ra()], **kw))["report"]["stopped"], stopped, kw)
     def test_incomplete_scan_gets_partial_file_name(self):
         r = result([], failed_scopes=[{"scope": "/x", "error": "e"}])
         self.assertEqual(ara.HTMLOutputHandler("x").file_name(r), "role_assignments_my-mg.partial.html")
@@ -468,6 +491,7 @@ class HTMLReportExtrasTest(unittest.TestCase):
     def test_export_uses_the_csv_columns(self):
         for col in ara.CSVOutputHandler.COLUMNS: self.assertIn(col, self.T)
         self.assertIn("_filtered.csv", self.T)
+        self.assertIn(json.dumps(list(ara.CSVOutputHandler.COLUMNS)), self.T)
     def test_theme_and_print_hooks_exist(self):
         for needle in ("prefers-color-scheme", "data-theme", "ara-theme", "@media print", "prefers-reduced-motion"):
             self.assertIn(needle, self.T)
@@ -489,6 +513,12 @@ class ConsoleSummaryTest(unittest.TestCase):
         out = buf.getvalue()
         self.assertLess(out.index("Owner"), out.index("Reader"))
         for needle in ("PIM", "/subscriptions/x", "/tmp/r.html"): self.assertIn(needle, out)
+    def test_incomplete_scan_is_stated_and_report_path_is_last(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ara.ConsoleSummary().print(result([ra()], failed_scopes=[{"scope": "/x", "error": "e"}]), ["/tmp/r.html", "/tmp/r.json"])
+        out = buf.getvalue()
+        self.assertIn("Scan incomplete.", out); self.assertTrue(out.rstrip().endswith("/tmp/r.html"))
 
 class FakeScanner:
     """Stands in for Scanner: resolve returns the ref unchanged; scan returns the result or raises root_error."""
@@ -532,6 +562,21 @@ class ApplicationTest(unittest.TestCase):
     def test_name_filter_without_graph_exits_1_before_scanning(self):
         code, files = run(app(result([ra()]), graph=None), "--scope", "my-mg", "--principal-name-filter", "^a")
         self.assertEqual((code, files), (1, []))
+    def test_graph_failure_with_named_rows_does_not_apply_graph_filters(self):
+        class LookupFails(FakeGraph):
+            def get_by_ids(self, ids):
+                if ids == ["00000000-0000-0000-0000-000000000000"]: return {}
+                raise ara.APIError("down", status=503)
+        code, files = run(app(result([ra()]), graph=LookupFails({})), "--scope", "my-mg", "--exclude-managed-identities")
+        self.assertEqual(code, 3); self.assertIn("role_assignments_my-mg.partial.json", files)
+    def test_graph_precheck_failure_exits_1_and_writes_nothing(self):
+        graph = FakeGraph({}, error=ara.APIError("token rejected", status=403))
+        code, files = run(app(result([ra()]), graph=graph), "--scope", "my-mg", "--exclude-managed-identities")
+        self.assertEqual((code, files), (1, []))
+    def test_resource_types_are_recorded_as_filter(self):
+        a = app(result([ra()]))
+        run(a, "--scope", "my-mg", "--depth", "resources", "--resource-types", "Microsoft.Compute/virtualMachines")
+        self.assertIn("resource_types", a.last_result.filters_applied)
     def test_csv_is_written_in_addition(self):
         _, files = run(app(result([ra()])), "--scope", "my-mg", "--format", "csv")
         self.assertIn("role_assignments_my-mg.csv", files); self.assertIn("role_assignments_my-mg.json", files)
@@ -571,7 +616,8 @@ class DocsTest(unittest.TestCase):
         for gone in ("--max-resources", "--exclude-system", "Keychain", "PERFORMANCE.md", "2.0.0", "2.1.0", "LRU", "code%20style-black"):
             self.assertNotIn(gone, text)
         self.assertIn("3.0.0", text)
-        for phrase in ("assignments_before_filters", "these two filters are not applied"): self.assertIn(phrase, text)
+        for phrase in ("assignments_before_filters", "no filters are applied", "the Graph lookup failed or left principals unnamed",
+                       "assignments inherited from above it are not", "renewed when it expires"): self.assertIn(phrase, text)
     def test_changelog_has_3_0_0(self):
         self.assertIn("## [3.0.0]", (self.ROOT / "CHANGELOG.md").read_text())
 
