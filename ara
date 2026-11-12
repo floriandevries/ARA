@@ -1,23 +1,14 @@
 #!/usr/bin/env python3
 """
-Azure Role Assignment Exporter (ARA)
-====================================
+ARA, the role atlas for Azure
+=============================
 
-A professional tool for exporting Azure role assignments at management group
-and subscription scopes with comprehensive reporting, PIM integration, and 
-multiple output formats.
+Scans the role assignments under an Azure management group or subscription,
+reads PIM eligibility, resolves principal names, and writes a self-contained
+HTML report and a JSON file. A CSV file is written on request.
 
-Features:
-- PIM (Privileged Identity Management) integration - distinguish between active 
-  permanent, active time-bound, eligible permanent, and eligible time-bound assignments
-- Multiple authentication methods (environment, Azure CLI, keychain, interactive)
-- Hierarchical management group scanning
-- Principal name resolution via Microsoft Graph API
-- JSON and CSV output formats
-- Direct assignment filtering (excludes inherited)
-- Robust error handling and logging
-- Production-ready with proper OOP design
-- Zero external dependencies
+Direct assignments only; inherited assignments are not listed. Python standard
+library only.
 
 Requirements:
 - Python 3.7+
@@ -27,20 +18,19 @@ Requirements:
 
 Author: fjdev
 License: MIT
-Version: 2.1.0
+Version: 3.0.0
 """
 
 # Standard library imports
 import argparse
-import asyncio
-import base64
 import csv
-import functools
+import http.client
+import io
 import json
 import logging
 import os
 import re
-import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -48,16 +38,20 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Dict, List, Optional, Any
+from dataclasses import asdict, dataclass, field, replace
+from collections import Counter
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-__version__ = "2.1.0"
+__version__ = "3.0.0"
 __author__ = "fjdev"
 
 
 class ARAConfig:
     """Configuration constants for ARA."""
+    DESCRIPTOR = "the role atlas for Azure"
+    SLOGAN = "Who can do what, and where."
+
     # API Endpoints
     AZURE_MANAGEMENT_URL = "https://management.azure.com"
     GRAPH_API_URL = "https://graph.microsoft.com/v1.0"
@@ -66,24 +60,16 @@ class ARAConfig:
     AZURE_API_VERSION = "2020-01-01"
     AUTH_API_VERSION = "2022-04-01"
     MGMT_GROUP_API_VERSION = "2020-05-01"
+    PIM_API_VERSION = "2020-10-01"
+    TENANT_API_VERSION = "2022-12-01"
     
     # Timeouts
     API_REQUEST_TIMEOUT = 30  # seconds
     TOKEN_VALIDATION_TIMEOUT = 10  # seconds
     
-    # Performance
-    MAX_CONCURRENT_REQUESTS = 5
-    CACHE_SIZE_LIMIT = 1000
-    
     # File Handling
     RESULTS_DIR = "results"
     JSON_INDENT = 2
-    CSV_ENCODING = "utf-8"
-    
-    # Authentication
-    KEYCHAIN_SERVICE = 'azure-role-assignment-exporter'
-    KEYCHAIN_ACCOUNT = 'azure-credentials'
-    KEYCHAIN_UPDATE_FLAG = '-U'
     
     # Environment variables
     TOKEN_ENV_VARS = [
@@ -91,53 +77,37 @@ class ARAConfig:
     ]
     
     # HTTP status codes
-    HTTP_OK = 200
     HTTP_UNAUTHORIZED = 401
     HTTP_FORBIDDEN = 403
     HTTP_NOT_FOUND = 404
     HTTP_RATE_LIMITED = 429
     HTTP_SERVER_ERROR = 500
     
-    # Output formatting
-    SEPARATOR_LENGTH = 80
-    SUBSECTION_SEPARATOR_LENGTH = 60
-    
     # Exit codes
     EXIT_CODE_SUCCESS = 0
     EXIT_CODE_ERROR = 1
+    EXIT_CODE_USAGE = 2
+    EXIT_CODE_INCOMPLETE = 3
     EXIT_CODE_INTERRUPT = 130
     
+    ASSIGNMENT_TYPES = ("Active permanent", "Active time-bound", "Eligible permanent", "Eligible time-bound", "Active")
+    PRINCIPAL_TYPES = ("User", "Group", "ServicePrincipal", "ManagedIdentity", "ForeignGroup", "Device")
+    HIGH_PRIVILEGE_ROLES = ("Owner", "User Access Administrator", "Role Based Access Control Administrator")
+
     # Scan depth levels
     DEPTH_MANAGEMENT_GROUPS = 'management-groups'
     DEPTH_SUBSCRIPTIONS = 'subscriptions'
     DEPTH_RESOURCE_GROUPS = 'resource-groups'
     DEPTH_RESOURCES = 'resources'
-    DEFAULT_DEPTH = DEPTH_MANAGEMENT_GROUPS
     
     # Resource scanning limits
-    DEFAULT_MAX_RESOURCES = 10000
     DEFAULT_API_DELAY = 0.1  # seconds between API calls
-    RATE_LIMIT_RETRY_DELAY = 60  # seconds to wait on 429
-    MAX_RETRY_ATTEMPTS = 3
-    
-    # Resource API version
-    RESOURCE_API_VERSION = "2021-04-01"
+    MAX_ATTEMPTS = 4
+    RETRY_WAITS = (2, 4, 8)  # seconds before retry 1, 2, 3 unless Retry-After says otherwise
     
     # Logging
     DEFAULT_LOG_FORMAT = '%(asctime)s - %(levelname)s - %(message)s'
     DEFAULT_DATE_FORMAT = '%H:%M:%S'
-
-
-def safe_print(*args, **kwargs):
-    """Print function that handles BrokenPipeError gracefully."""
-    try:
-        print(*args, **kwargs)
-    except BrokenPipeError:
-        try:
-            sys.stdout.close()
-        except OSError:
-            pass
-        sys.exit(0)
 
 
 # Configure logging
@@ -161,7 +131,14 @@ class AuthenticationError(ARAError):
 
 
 class APIError(ARAError):
-    """Raised when API operations fail."""
+    """Raised when API operations fail. `status` is the HTTP status, if any."""
+    def __init__(self, message: str, status: Optional[int] = None):
+        super().__init__(message)
+        self.status = status
+
+
+class PIMUnavailable(ARAError):
+    """Raised when the PIM lists are forbidden (HTTP 403)."""
     pass
 
 
@@ -275,14 +252,19 @@ class AssignmentFilter:
         self.principal_type_filter = self._parse_list_filter(args.principal_type_filter)
         self.assignment_type_filter = self._parse_list_filter(getattr(args, 'assignment_type_filter', None))
         self.principal_name_pattern = None
-        self.exclude_system = args.exclude_system
+        self.exclude_managed_identities = getattr(args, 'exclude_managed_identities', False)
+        for option, values, valid in (('--assignment-type-filter', self.assignment_type_filter, ARAConfig.ASSIGNMENT_TYPES),
+                                      ('--principal-type-filter', self.principal_type_filter, ARAConfig.PRINCIPAL_TYPES)):
+            unknown = [v for v in values or [] if v not in [t.lower() for t in valid]]
+            if unknown:
+                raise ValidationError(f"Unknown value for {option}: {', '.join(unknown)}. Valid values: {', '.join(valid)}")
         
         # Compile regex pattern for principal name filter
         if args.principal_name_filter:
             try:
                 self.principal_name_pattern = re.compile(args.principal_name_filter, re.IGNORECASE)
             except re.error as e:
-                raise ValueError(f"Invalid regex pattern in --principal-name-filter: {e}")
+                raise ValidationError(f"Invalid regex pattern in --principal-name-filter: {e}")
     
     @staticmethod
     def _parse_list_filter(filter_value: Optional[str]) -> Optional[List[str]]:
@@ -328,8 +310,12 @@ class AssignmentFilter:
             self.principal_type_filter or
             self.assignment_type_filter or
             self.principal_name_pattern or
-            self.exclude_system
+            self.exclude_managed_identities
         )
+
+    def needs_graph(self) -> bool:
+        """True when a filter depends on names or types that only Microsoft Graph supplies."""
+        return bool(self.principal_name_pattern or self.exclude_managed_identities)
     
     def _matches(self, assignment: 'RoleAssignment') -> bool:
         """Check if an assignment matches all filter criteria.
@@ -352,15 +338,13 @@ class AssignmentFilter:
         if self.assignment_type_filter and assignment.assignment_type.lower() not in self.assignment_type_filter:
             return False
         
-        # Principal name pattern filter
-        if self.principal_name_pattern and not self.principal_name_pattern.search(assignment.principal_name):
+        # Principal name pattern filter; rows without a name never match
+        if self.principal_name_pattern and not (assignment.principal_name and
+                                                self.principal_name_pattern.search(assignment.principal_name)):
             return False
         
-        # Exclude system-assigned managed identities
-        if self.exclude_system and assignment.principal_type.lower() == 'serviceprincipal':
-            # System-assigned managed identities typically have names matching the resource
-            if assignment.principal_name and assignment.principal_name.lower().startswith('system-'):
-                return False
+        if self.exclude_managed_identities and assignment.principal_type == 'ManagedIdentity':
+            return False
         
         return True
     
@@ -384,8 +368,8 @@ class AssignmentFilter:
         if self.principal_name_pattern:
             summary['principal_name_filter'] = self.principal_name_pattern.pattern
         
-        if self.exclude_system:
-            summary['exclude_system'] = True
+        if self.exclude_managed_identities:
+            summary['exclude_managed_identities'] = True
         
         return summary
 
@@ -395,7 +379,7 @@ class AssignmentFilter:
 class RoleAssignment:
     """Immutable role assignment information."""
     principal_id: str
-    principal_name: str
+    principal_name: Optional[str]
     principal_type: str
     role_name: str
     role_id: str
@@ -406,7 +390,8 @@ class RoleAssignment:
     assignment_type: str = "Active permanent"  # "Active permanent", "Active time-bound", "Eligible permanent", "Eligible time-bound"
     start_date_time: Optional[str] = None  # ISO 8601 format
     end_date_time: Optional[str] = None  # ISO 8601 format
-    
+    principal_upn: Optional[str] = None  # userPrincipalName from Microsoft Graph
+
     def __post_init__(self):
         """Validate data after initialization."""
         if not self.principal_id:
@@ -415,16 +400,59 @@ class RoleAssignment:
             raise ValidationError("Role name cannot be empty")
         if not self.scope:
             raise ValidationError("Scope cannot be empty")
-        valid_types = ("Active permanent", "Active time-bound", "Eligible permanent", "Eligible time-bound")
-        if self.assignment_type not in valid_types:
-            raise ValidationError(f"Assignment type must be one of {valid_types}, got: {self.assignment_type}")
-    
-    @property
-    def full_scope_path(self) -> str:
-        """Get full scope path for display."""
-        if self.scope_name:
-            return f"{self.scope_name} ({self.scope_type})"
-        return self.scope
+        if self.assignment_type not in ARAConfig.ASSIGNMENT_TYPES:
+            raise ValidationError(f"Assignment type must be one of {ARAConfig.ASSIGNMENT_TYPES}, got: {self.assignment_type}")
+
+
+@dataclass(frozen=True)
+class ScopeRef:
+    """A parsed --scope argument. kind is 'management-group', 'subscription' or 'guid'."""
+    path: str
+    kind: str
+    name: str
+
+
+class ScopeParser:
+    """Parses the --scope argument and resolves the default depth."""
+    _GUID = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+    _PREFIXED = re.compile(
+        r'^/?(?:providers/Microsoft\.Management/)?(?P<kind>managementGroups|subscriptions)/(?P<name>[^/]+)/?$',
+        re.IGNORECASE)
+    _BARE = re.compile(r'^(?P<name>[^/]+)$')
+    _GUID_RE = re.compile('^' + _GUID + '$', re.IGNORECASE)
+    VALID_FORMS = (
+        "my-mg", "managementGroups/my-mg", "/providers/Microsoft.Management/managementGroups/my-mg",
+        "<subscription-guid>", "subscriptions/<subscription-guid>", "/subscriptions/<subscription-guid>")
+
+    @staticmethod
+    def parse(text: str) -> ScopeRef:
+        error = ValidationError(f"Invalid scope '{text}'. Valid forms: " + ", ".join(ScopeParser.VALID_FORMS))
+        m = ScopeParser._PREFIXED.match(text.strip())
+        if m:
+            name = m.group('name')
+            if m.group('kind').lower() == 'subscriptions':
+                if not ScopeParser._GUID_RE.match(name):
+                    raise error
+                name = name.lower()
+                return ScopeRef(f"/subscriptions/{name}", 'subscription', name)
+            return ScopeRef(f"/providers/Microsoft.Management/managementGroups/{name}", 'management-group', name)
+        m = ScopeParser._BARE.match(text.strip())
+        if not m:
+            raise error
+        name = m.group('name')
+        if ScopeParser._GUID_RE.match(name):
+            return ScopeRef(f"/subscriptions/{name.lower()}", 'guid', name.lower())
+        return ScopeRef(f"/providers/Microsoft.Management/managementGroups/{name}", 'management-group', name)
+
+    @staticmethod
+    def resolve_depth(kind: str, depth: Optional[str]) -> str:
+        if kind == 'subscription':
+            if depth is None:
+                return ARAConfig.DEPTH_RESOURCE_GROUPS
+            if depth == ARAConfig.DEPTH_MANAGEMENT_GROUPS:
+                raise ValidationError(f"Depth '{depth}' is not valid for a subscription scope")
+            return depth
+        return depth or ARAConfig.DEPTH_MANAGEMENT_GROUPS
 
 
 @dataclass
@@ -433,9 +461,8 @@ class Scope:
     scope_path: str
     name: str
     scope_type: str  # 'Management Group', 'Subscription', 'Resource Group', or 'Resource'
-    depth: int = 0
-    parent_scope: Optional[str] = None
     resource_type: Optional[str] = None  # For individual resources (e.g., 'Microsoft.Compute/virtualMachines')
+    subscription_id: Optional[str] = None
     
     def __post_init__(self):
         """Validate scope data."""
@@ -447,93 +474,97 @@ class Scope:
         if self.scope_type not in valid_types:
             raise ValidationError(f"Invalid scope type: {self.scope_type}. Must be one of {valid_types}")
     
+    _MG_PATH = re.compile(r'^/providers/Microsoft\.Management/managementGroups/([^/]+)/?$', re.IGNORECASE)
+    _SUB_PATH = re.compile(r'^/subscriptions/([^/]+)(?:/(.*))?$', re.IGNORECASE)
+
     @staticmethod
-    def from_path(scope_path: str, depth: int = 0) -> 'Scope':
-        """Create a Scope object from a scope path."""
-        path_lower = scope_path.lower()
-        
-        if '/resourcegroups/' in path_lower:
-            parts = scope_path.split('/')
-            # Check if it's a resource or just a resource group
-            if len(parts) > 5 and '/providers/' in path_lower:
-                # It's a resource: /subscriptions/{id}/resourceGroups/{rg}/providers/{provider}/{type}/{name}
-                try:
-                    rg_index = next(i for i, p in enumerate(parts) if p.lower() == 'resourcegroups')
-                    provider_index = next(i for i, p in enumerate(parts) if p.lower() == 'providers' and i > rg_index)
-                    resource_name = parts[-1]
-                    resource_type = '/'.join(parts[provider_index+1:-1])
-                    return Scope(
-                        scope_path=scope_path,
-                        name=resource_name,
-                        scope_type='Resource',
-                        depth=depth,
-                        resource_type=resource_type
-                    )
-                except (StopIteration, IndexError):
-                    pass
-            # It's a resource group: /subscriptions/{id}/resourceGroups/{name}
-            try:
-                rg_index = next(i for i, p in enumerate(parts) if p.lower() == 'resourcegroups')
-                rg_name = parts[rg_index + 1] if rg_index + 1 < len(parts) else 'Unknown'
-                return Scope(
-                    scope_path=scope_path,
-                    name=rg_name,
-                    scope_type='Resource Group',
-                    depth=depth
-                )
-            except (StopIteration, IndexError):
-                pass
-        
-        if '/subscriptions/' in path_lower:
-            parts = scope_path.split('/')
-            sub_id = parts[-1] if parts else 'Unknown'
-            return Scope(
-                scope_path=scope_path,
-                name=sub_id,
-                scope_type='Subscription',
-                depth=depth
-            )
-        
-        if '/managementgroups/' in path_lower:
-            parts = scope_path.split('/')
-            mg_id = parts[-1] if parts else 'Unknown'
-            return Scope(
-                scope_path=scope_path,
-                name=mg_id,
-                scope_type='Management Group',
-                depth=depth
-            )
-        
-        # Default fallback
-        return Scope(
-            scope_path=scope_path,
-            name='Unknown',
-            scope_type='Subscription',
-            depth=depth
-        )
+    def from_path(path: str) -> 'Scope':
+        """Classify an ARM scope path. Raises ValidationError if it cannot."""
+        p = path.rstrip('/')
+        m = Scope._MG_PATH.match(p)
+        if m:
+            return Scope(p, m.group(1), 'Management Group')
+        m = Scope._SUB_PATH.match(p)
+        if not m:
+            raise ValidationError(f"Cannot classify scope path: '{path}'")
+        sub, rest = m.group(1), (m.group(2) or '')
+        if not rest:
+            return Scope(p, sub, 'Subscription', subscription_id=sub)
+        parts = rest.split('/')
+        if parts[0].lower() == 'resourcegroups':
+            if len(parts) == 2 and parts[1]:
+                return Scope(p, parts[1], 'Resource Group', subscription_id=sub)
+            parts = parts[2:]
+        if len(parts) >= 4 and parts[0].lower() == 'providers' and len(parts) % 2 == 0:
+            # providers/<namespace>/<type>/<name>[/<subtype>/<name>...]
+            rtype = '/'.join([parts[1]] + parts[2::2])
+            return Scope(p, parts[-1], 'Resource', resource_type=rtype, subscription_id=sub)
+        raise ValidationError(f"Cannot classify scope path: '{path}'")
 
 
 @dataclass
 class ScanResult:
-    """Results container for role assignment scan."""
-    organization: str
+    """Outcome of one scan: the assignments plus what was and was not covered."""
     scope: str
-    scan_timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
-    total_scopes_scanned: int = 0
-    total_assignments_found: int = 0
-    assignments: List[RoleAssignment] = field(default_factory=list)
-    scanned_scopes: List[Scope] = field(default_factory=list)
+    scope_name: str
+    depth: str
+    scan_timestamp: str  # UTC, YYYY-MM-DDTHH:MM:SSZ
+    assignments: List[RoleAssignment]
+    failed_scopes: List[Dict[str, str]] = field(default_factory=list)  # {"scope", "error"}
+    pim_skipped: bool = False
+    pim_unavailable_scopes: List[str] = field(default_factory=list)
+    names: str = "unavailable"
+    management_groups_scanned: int = 0
+    subscriptions_scanned: int = 0
     filters_applied: Dict[str, Any] = field(default_factory=dict)
-    
-    def add_assignment(self, assignment: RoleAssignment):
-        """Add a role assignment to results."""
-        self.assignments.append(assignment)
-        self.total_assignments_found += 1
-    
-    def add_scanned_scope(self, scope: Scope):
-        """Add a scanned scope to results."""
-        self.scanned_scopes.append(scope)
-        self.total_scopes_scanned += 1
+    assignments_before_filters: int = 0
+    stopped: bool = False
+    interrupted: bool = False
+    filters_not_applied: bool = False
+    tenant: Optional[Dict[str, Optional[str]]] = None  # {"id", "name", "domain"}
+
+    @property
+    def complete(self) -> bool:
+        return not (self.failed_scopes or self.stopped or self.interrupted or self.filters_not_applied)
+
+    @property
+    def pim_status(self) -> str:
+        if self.pim_skipped:
+            return "skipped"
+        if not self.pim_unavailable_scopes:
+            return "included"
+        if len(self.pim_unavailable_scopes) >= self.management_groups_scanned + self.subscriptions_scanned:
+            return "unavailable"
+        return "partial"
+
+    @property
+    def scopes_with_assignments(self) -> int:
+        return len({a.scope.lower() for a in self.assignments})
+
+    def to_dict(self) -> Dict:
+        return {
+            "metadata": {
+                "tool": "ARA",
+                "version": __version__,
+                "schema_version": 3,
+                "scan_timestamp": self.scan_timestamp,
+                "scope": self.scope,
+                "tenant": self.tenant,
+                "depth": self.depth,
+                "complete": self.complete,
+                "failed_scopes": self.failed_scopes,
+                "pim": self.pim_status,
+                "pim_unavailable_scopes": self.pim_unavailable_scopes,
+                "names": self.names,
+                "filters_applied": self.filters_applied,
+                "management_groups_scanned": self.management_groups_scanned,
+                "subscriptions_scanned": self.subscriptions_scanned,
+                "scopes_with_assignments": self.scopes_with_assignments,
+                "total_assignments_found": len(self.assignments),
+                "assignments_before_filters": self.assignments_before_filters,
+            },
+            "role_assignments": [asdict(a) for a in self.assignments],
+        }
 
 
 # Authentication System
@@ -571,12 +602,14 @@ class EnvironmentAuthProvider(AuthenticationProvider):
 class AzureCliAuthProvider(AuthenticationProvider):
     """Get token from Azure CLI."""
     
-    def get_token(self) -> Optional[str]:
-        """Get token from Azure CLI."""
+    def get_token(self, resource: str = ARAConfig.AZURE_MANAGEMENT_URL) -> Optional[str]:
+        """Get a token for `resource` from Azure CLI; None when az is not installed or not logged in."""
+        az = shutil.which('az')
+        if not az:
+            return None
         try:
-            import subprocess
             result = subprocess.run(
-                ['az', 'account', 'get-access-token', '--resource', ARAConfig.AZURE_MANAGEMENT_URL],
+                [az, 'account', 'get-access-token', '--resource', resource],
                 capture_output=True,
                 text=True,
                 check=True,
@@ -588,10 +621,8 @@ class AzureCliAuthProvider(AuthenticationProvider):
             if token:
                 logger.debug("Retrieved token from Azure CLI")
                 return token
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
             logger.debug("Could not retrieve token from Azure CLI")
-        except Exception as e:
-            logger.debug(f"Azure CLI access failed: {e}")
         return None
     
     def get_name(self) -> str:
@@ -599,88 +630,31 @@ class AzureCliAuthProvider(AuthenticationProvider):
         return "Azure CLI"
 
 
-class KeychainAuthProvider(AuthenticationProvider):
-    """Get token from macOS Keychain."""
-    
-    def get_token(self) -> Optional[str]:
-        """Get token from macOS Keychain."""
-        try:
-            import subprocess
-            result = subprocess.run(
-                ['security', 'find-generic-password', '-s', ARAConfig.KEYCHAIN_SERVICE, 
-                 '-a', ARAConfig.KEYCHAIN_ACCOUNT, '-w'],
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=ARAConfig.TOKEN_VALIDATION_TIMEOUT
-            )
-            
-            token = result.stdout.strip()
-            if token:
-                logger.debug(f"Found token in keychain: {ARAConfig.KEYCHAIN_SERVICE}")
-                return token
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
-            logger.debug(f"Could not retrieve token from keychain")
-        except Exception as e:
-            logger.debug(f"Keychain access failed: {e}")
-        return None
-    
-    def get_name(self) -> str:
-        """Get provider name."""
-        return "macOS Keychain"
-
-
 class InteractiveAuthProvider(AuthenticationProvider):
     """Get token through interactive prompt."""
     
     def get_token(self) -> Optional[str]:
-        """Prompt user for token securely."""
-        safe_print("\n🔐 Azure authentication required.")
-        safe_print("   Please provide an Azure access token with permissions to read:")
-        safe_print("   • Role assignments")
-        safe_print("   • Management groups")
-        safe_print("   • Microsoft Graph (for principal name resolution)")
-        safe_print()
-        safe_print("   You can get a token via:")
-        safe_print("   • az account get-access-token --resource https://management.azure.com")
-        safe_print("   • Azure Portal > Cloud Shell > az account get-access-token")
-        safe_print()
+        """Prompt for a token; only when stdin is a terminal."""
+        if not sys.stdin.isatty():
+            return None
+        print("Azure authentication required. Provide an access token that can read")
+        print("role assignments and management groups. To get one, run:")
+        print("  az account get-access-token --resource https://management.azure.com")
+        print()
         
         try:
             import getpass
-            token = getpass.getpass("Enter your Azure access token: ").strip()
+            token = getpass.getpass("Azure access token: ").strip()
             if not token:
                 logger.warning("No token provided")
                 return None
-            
-            # Offer to save to keychain on macOS
-            if sys.platform == 'darwin':
-                self._offer_keychain_save(token)
-            
             return token
         except KeyboardInterrupt:
-            safe_print("\n❌ Authentication cancelled by user")
+            print("\nAuthentication cancelled.")
             return None
         except Exception as e:
             logger.error(f"Error during interactive authentication: {e}")
             return None
-    
-    def _offer_keychain_save(self, token: str):
-        """Offer to save token to keychain."""
-        try:
-            response = input("\n💾 Save token to macOS Keychain for future use? (y/N): ").strip().lower()
-            if response in ['y', 'yes']:
-                import subprocess
-                subprocess.run([
-                    'security', 'add-generic-password',
-                    '-s', ARAConfig.KEYCHAIN_SERVICE,
-                    '-a', ARAConfig.KEYCHAIN_ACCOUNT,
-                    '-w', token,
-                    ARAConfig.KEYCHAIN_UPDATE_FLAG
-                ], capture_output=True, check=True)
-                safe_print("✅ Token saved to keychain")
-        except Exception as e:
-            logger.debug(f"Could not save to keychain: {e}")
     
     def get_name(self) -> str:
         """Get provider name."""
@@ -688,18 +662,11 @@ class InteractiveAuthProvider(AuthenticationProvider):
 
 
 class AzureAuthenticationManager:
-    """Manages Azure authentication with multiple providers."""
+    """Finds a token: --token, environment variables, Azure CLI, then an interactive prompt."""
     
-    def __init__(self, allow_interactive: bool = True):
-        """Initialize authentication manager."""
-        self.providers = [
-            EnvironmentAuthProvider(),
-            AzureCliAuthProvider(),
-            KeychainAuthProvider(),
-        ]
-        
-        if allow_interactive:
-            self.providers.append(InteractiveAuthProvider())
+    def __init__(self):
+        self.providers = [EnvironmentAuthProvider(), AzureCliAuthProvider(), InteractiveAuthProvider()]
+        self.source = None  # type: Optional[AuthenticationProvider]
     
     def get_token(self, override_token: Optional[str] = None) -> str:
         """Get Azure access token using various methods."""
@@ -707,1290 +674,1204 @@ class AzureAuthenticationManager:
             logger.info("Using provided token")
             return override_token
         
-        logger.info("🔍 Looking for Azure authentication...")
+        logger.info("Looking for Azure authentication...")
         
         for provider in self.providers:
-            try:
-                token = provider.get_token()
-                if token:
-                    if self._validate_token(token):
-                        logger.info(f"✅ Authenticated via {provider.get_name()}")
-                        return token
-                    else:
-                        logger.warning(f"❌ Invalid token from {provider.get_name()}")
-            except Exception as e:
-                logger.debug(f"Provider {provider.get_name()} failed: {e}")
+            token = provider.get_token()
+            if token:
+                logger.info(f"Authenticated via {provider.get_name()}")
+                self.source = provider
+                return token
         
-        raise AuthenticationError("No valid authentication token found")
+        raise AuthenticationError("No Azure token found. Pass --token, set AZURE_ACCESS_TOKEN, or run az login.")
     
-    def _validate_token(self, token: str) -> bool:
-        """Validate token by making a test API call."""
-        try:
-            url = f"{ARAConfig.AZURE_MANAGEMENT_URL}/subscriptions?api-version={ARAConfig.AZURE_API_VERSION}"
-            headers = {'Authorization': f'Bearer {token}'}
-            
-            request = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(request, timeout=ARAConfig.TOKEN_VALIDATION_TIMEOUT) as response:
-                if response.status == ARAConfig.HTTP_OK:
-                    data = json.loads(response.read().decode())
-                    sub_count = len(data.get('value', []))
-                    logger.debug(f"Token validation successful - found {sub_count} subscriptions")
-                    return True
-            return False
-        except Exception as e:
-            logger.debug(f"Token validation failed: {e}")
-            return False
+    def refresher(self) -> Optional[Callable[[], Optional[str]]]:
+        """The Azure CLI token getter when the token came from az, otherwise None."""
+        return self.source.get_token if isinstance(self.source, AzureCliAuthProvider) else None
 
 
 # API Clients
-class AzureAPIClient:
-    """Azure API client with caching, rate limiting, and error handling."""
-    
-    def __init__(self, token: str, api_delay: float = ARAConfig.DEFAULT_API_DELAY):
-        """Initialize API client."""
+class HttpClient:
+    """JSON over HTTPS with a bearer token, retries, pagination and one token refresh on 401."""
+
+    def __init__(self, token: str, api_delay: float = ARAConfig.DEFAULT_API_DELAY,
+                 refresh_token: Optional[Callable[[], Optional[str]]] = None,
+                 opener: Callable = urllib.request.urlopen, sleep: Callable[[float], None] = time.sleep):
         if not token:
             raise ValueError("Token cannot be empty")
-        
         self.token = token
         self.api_delay = api_delay
-        self.headers = {
-            'Authorization': f'Bearer {token}',
-            'Content-Type': 'application/json',
-            'User-Agent': f'AzureRoleAssignmentExporter/{__version__}'
-        }
-        self._auth_verified = False
+        self.refresh_token = refresh_token
+        self.opener = opener
+        self.sleep = sleep
         self._last_request_time = 0.0
-    
-    @functools.lru_cache(maxsize=ARAConfig.CACHE_SIZE_LIMIT)
-    def _make_cached_request(self, url: str, params_tuple: tuple = ()) -> Dict:
-        """Make a cached request to reduce duplicate API calls."""
-        params = dict(params_tuple) if params_tuple else None
-        return self._make_request_internal(url, params)
-    
-    def _make_request(self, url: str, params: Optional[Dict] = None) -> Dict:
-        """Public interface for making requests."""
-        if params:
-            params_tuple = tuple(sorted(params.items()))
-            return self._make_cached_request(url, params_tuple)
-        else:
-            return self._make_cached_request(url)
-    
+
     def _apply_rate_limit(self) -> None:
         """Apply rate limiting between API calls."""
         if self.api_delay > 0:
-            current_time = time.time()
-            time_since_last = current_time - self._last_request_time
+            time_since_last = time.time() - self._last_request_time
             if time_since_last < self.api_delay:
-                time.sleep(self.api_delay - time_since_last)
+                self.sleep(self.api_delay - time_since_last)
             self._last_request_time = time.time()
-    
-    def _make_request_internal(self, url: str, params: Optional[Dict] = None) -> Dict:
-        """Make a request to the Azure API with error handling and retry logic."""
+
+    def request(self, method: str, url: str, params: Optional[Dict] = None, body: Optional[Dict] = None) -> Dict:
+        """Send one request; retry 429, 5xx and network errors; refresh the token once on 401."""
         if params:
-            url += "?" + urllib.parse.urlencode(params)
-        
-        request = urllib.request.Request(url, headers=self.headers)
-        
-        # Retry loop for rate limiting
-        for attempt in range(ARAConfig.MAX_RETRY_ATTEMPTS):
+            url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
+        data = json.dumps(body).encode() if body is not None else None
+        refreshed = False
+        for attempt in range(ARAConfig.MAX_ATTEMPTS):
+            self._apply_rate_limit()
+            request = urllib.request.Request(url, data=data, method=method, headers={
+                'Authorization': f'Bearer {self.token}',
+                'Content-Type': 'application/json',
+                'User-Agent': 'ARA/3.0.0',
+            })
+            retry_after = None
             try:
-                self._apply_rate_limit()
-                
-                with urllib.request.urlopen(request, timeout=ARAConfig.API_REQUEST_TIMEOUT) as response:
-                    return json.loads(response.read().decode())
-                    
+                with self.opener(request, timeout=ARAConfig.API_REQUEST_TIMEOUT) as response:
+                    return json.loads(response.read().decode() or "{}")
             except urllib.error.HTTPError as e:
-                if e.code == ARAConfig.HTTP_RATE_LIMITED and attempt < ARAConfig.MAX_RETRY_ATTEMPTS - 1:
-                    wait_time = ARAConfig.RATE_LIMIT_RETRY_DELAY * (2 ** attempt)  # Exponential backoff
-                    logger.warning(f"Rate limited (429). Waiting {wait_time}s before retry (attempt {attempt + 1}/{ARAConfig.MAX_RETRY_ATTEMPTS})")
-                    time.sleep(wait_time)
+                if e.code == ARAConfig.HTTP_UNAUTHORIZED:
+                    new_token = self.refresh_token() if self.refresh_token and not refreshed else None
+                    if not new_token:
+                        raise AuthenticationError(f"Token rejected (HTTP 401) for {url}")
+                    self.token, refreshed = new_token, True
                     continue
-                else:
-                    self._handle_http_error(e, url)
-            except urllib.error.URLError as e:
-                raise APIError(f"Network error: {e}")
+                try:
+                    detail = e.read().decode(errors="replace")
+                except Exception:
+                    detail = ""
+                error = APIError(f"HTTP {e.code} for {url}: {detail}", e.code)
+                if e.code != ARAConfig.HTTP_RATE_LIMITED and e.code < ARAConfig.HTTP_SERVER_ERROR:
+                    raise error
+                retry_after = (e.headers or {}).get("Retry-After")
             except json.JSONDecodeError as e:
-                raise APIError(f"Invalid JSON response: {e}")
-        
-        raise APIError("Max retry attempts exceeded")
-    
-    def _handle_http_error(self, error: urllib.error.HTTPError, url: str) -> None:
-        """Handle HTTP errors consistently."""
-        try:
-            error_body = error.read().decode() if error.fp else ""
-        except Exception:
-            error_body = "Unable to read error response"
-        
-        error_messages = {
-            ARAConfig.HTTP_UNAUTHORIZED: "Authentication failed - check credentials",
-            ARAConfig.HTTP_FORBIDDEN: "Access forbidden - insufficient permissions",
-            ARAConfig.HTTP_NOT_FOUND: "Resource not found",
-            ARAConfig.HTTP_RATE_LIMITED: "Rate limit exceeded - please wait",
-            ARAConfig.HTTP_SERVER_ERROR: "Azure API server error",
-        }
-        
-        message = error_messages.get(error.code, f"HTTP {error.code}")
-        raise APIError(f"{message}: {error_body}")
-    
-    def test_authentication(self) -> bool:
-        """Test if the token works."""
-        if self._auth_verified:
-            return True
-        
-        try:
-            url = f"{ARAConfig.AZURE_MANAGEMENT_URL}/subscriptions?api-version={ARAConfig.AZURE_API_VERSION}"
-            data = self._make_request(url)
-            
-            subscription_count = len(data.get('value', []))
-            logger.info(f"✅ Authenticated - found {subscription_count} subscriptions")
-            self._auth_verified = True
-            return True
-            
-        except APIError as e:
-            logger.error(f"❌ Authentication test failed: {e}")
-            return False
+                raise APIError(f"Invalid JSON response from {url}: {e}")
+            except (OSError, http.client.HTTPException) as e:  # URLError, socket.timeout, connection resets, truncated bodies
+                error = APIError(f"Network error for {url}: {e}")
+            if attempt == ARAConfig.MAX_ATTEMPTS - 1:
+                raise error
+            wait = int(retry_after) if retry_after and retry_after.strip().isdigit() else ARAConfig.RETRY_WAITS[attempt]
+            logger.warning(f"{error}. Retrying in {wait}s (attempt {attempt + 1}/{ARAConfig.MAX_ATTEMPTS})")
+            self.sleep(wait)
+        raise APIError(f"No response after {ARAConfig.MAX_ATTEMPTS} attempts for {url}")  # 401 refresh used the last attempt
+
+    def get(self, url: str, params: Optional[Dict] = None) -> Dict:
+        return self.request("GET", url, params)
+
+    def get_all(self, url: str, params: Optional[Dict] = None) -> List[Dict]:
+        """Concatenate `value` over all pages, following `nextLink` as given."""
+        items = []  # type: List[Dict]
+        while url:
+            page = self.get(url, params)
+            items.extend(page.get("value", []))
+            url, params = page.get("nextLink"), None
+        return items
 
 
-class ManagementGroupClient:
-    """Client for Azure Management Group operations."""
-    
-    def __init__(self, api_client: AzureAPIClient):
-        """Initialize management group client."""
-        self.api_client = api_client
-    
-    def get_management_group_id_from_scope(self, scope: str) -> str:
-        """Extract management group ID from scope."""
-        parts = scope.split('/')
-        try:
-            mg_index = parts.index('managementGroups')
-            return parts[mg_index + 1]
-        except (ValueError, IndexError):
-            raise ValidationError(
-                f"Invalid scope format: {scope}. "
-                f"Expected format: /providers/Microsoft.Management/managementGroups/{{mg-id}}"
-            )
-    
-    def get_management_group_hierarchy(self, mg_id: str) -> List[Scope]:
-        """Get all child management groups and subscriptions recursively."""
-        all_scopes = []
-        
-        def extract_children_recursive(parent_id: str, parent_name: str, depth: int = 0):
-            """Recursively extract management groups and subscriptions."""
-            try:
-                mg_data = self._get_management_group(parent_id)
-                
-                # Add current management group
-                scope = Scope(
-                    scope_path=f"/providers/Microsoft.Management/managementGroups/{parent_id}",
-                    name=parent_name or parent_id,
-                    scope_type='Management Group',
-                    depth=depth
-                )
-                all_scopes.append(scope)
-                
-                # Process children
-                children = mg_data.get('properties', {}).get('children', [])
-                for child in children:
-                    child_type = child.get('type', '')
-                    child_id = child.get('name', '')
-                    child_name = child.get('displayName', child_id)
-                    
-                    # Handle both formats: with and without leading slash
-                    if 'managementGroups' in child_type:
-                        extract_children_recursive(child_id, child_name, depth + 1)
-                    elif 'subscriptions' in child_type.lower():
-                        subscription_scope = Scope(
-                            scope_path=f"/subscriptions/{child_id}",
-                            name=child_name,
-                            scope_type='Subscription',
-                            depth=depth + 1
-                        )
-                        all_scopes.append(subscription_scope)
-                        
-            except Exception as e:
-                logger.warning(f"Could not retrieve children for {parent_id}: {e}")
-        
-        extract_children_recursive(mg_id, mg_id, 0)
-        return all_scopes
-    
-    def _get_management_group(self, mg_id: str) -> Dict:
-        """Get management group details."""
-        url = (f"{ARAConfig.AZURE_MANAGEMENT_URL}/providers/Microsoft.Management/"
-               f"managementGroups/{mg_id}?api-version={ARAConfig.MGMT_GROUP_API_VERSION}"
-               f"&$expand=children&$recurse=false")
-        return self.api_client._make_request(url)
+class AzureAPIClient(HttpClient):
+    """HttpClient for Azure Resource Manager."""
+    BASE = ARAConfig.AZURE_MANAGEMENT_URL
+
+    def url(self, path: str) -> str:
+        return self.BASE + path
 
 
-class SubscriptionClient:
-    """Client for Azure Subscription operations."""
-    
-    def __init__(self, api_client: AzureAPIClient):
-        """Initialize subscription client."""
-        self.api_client = api_client
-    
-    def get_subscription_details(self, subscription_id: str) -> Dict:
-        """Get subscription details including display name."""
-        url = (f"{ARAConfig.AZURE_MANAGEMENT_URL}/subscriptions/{subscription_id}"
-               f"?api-version=2020-01-01")
-        try:
-            return self.api_client._make_request(url)
-        except Exception as e:
-            logger.warning(f"Could not retrieve subscription details for {subscription_id}: {e}")
-            return {}
-    
-    def get_subscription_display_name(self, subscription_id: str) -> str:
-        """Get the display name for a subscription."""
-        details = self.get_subscription_details(subscription_id)
-        return details.get('displayName', subscription_id)
+class HierarchyClient:
+    """Reads the management group tree and subscription details."""
 
+    def __init__(self, api: AzureAPIClient):
+        self.api = api
+        self.tenant_id = None  # type: Optional[str]
 
-class RoleAssignmentClient:
-    """Client for Azure Role Assignment operations."""
-    
-    def __init__(self, api_client: AzureAPIClient):
-        """Initialize role assignment client."""
-        self.api_client = api_client
-        self._role_definition_cache = {}
-    
-    def get_direct_assignments_for_scope(self, scope: Scope) -> List[Dict]:
-        """Get only direct role assignments for a specific scope."""
-        assignments_data = []
-        
-        try:
-            url = (f"{ARAConfig.AZURE_MANAGEMENT_URL}{scope.scope_path}/"
-                   f"providers/Microsoft.Authorization/roleAssignments"
-                   f"?api-version={ARAConfig.AUTH_API_VERSION}")
-            
-            data = self.api_client._make_request(url)
-            
-            for assignment in data.get('value', []):
-                # Only include assignments directly assigned to this scope
-                assignment_scope = assignment.get('properties', {}).get('scope', '').lower()
-                if assignment_scope != scope.scope_path.lower():
-                    continue
-                
-                assignments_data.append(assignment)
-                
-        except Exception as e:
-            logger.warning(f"Error retrieving assignments for {scope.name}: {e}")
-        
-        return assignments_data
-    
-    def get_role_definition(self, role_def_id: str) -> Optional[str]:
-        """Get role definition name with caching."""
-        if role_def_id in self._role_definition_cache:
-            return self._role_definition_cache[role_def_id]
-        
-        try:
-            url = f"{ARAConfig.AZURE_MANAGEMENT_URL}{role_def_id}?api-version={ARAConfig.AUTH_API_VERSION}"
-            data = self.api_client._make_request(url)
-            role_name = data.get('properties', {}).get('roleName', 'Unknown')
-            self._role_definition_cache[role_def_id] = role_name
-            return role_name
-        except Exception as e:
-            logger.debug(f"Could not fetch role definition: {e}")
-            return "Unknown"
+    def management_group_tree(self, mg_id: str) -> Tuple[List[Scope], List[Scope]]:
+        """Management groups (root first) and subscriptions under mg_id, from one recursive call."""
+        root = self.api.get(self.api.url(f"/providers/Microsoft.Management/managementGroups/{mg_id}"), {
+            "api-version": ARAConfig.MGMT_GROUP_API_VERSION, "$expand": "children", "$recurse": "true"})
+        props = root.get('properties') or {}
+        self.tenant_id = props.get('tenantId')
+        mgs = [Scope(f"/providers/Microsoft.Management/managementGroups/{mg_id}",
+                     props.get('displayName') or mg_id, 'Management Group')]
+        subs = []  # type: List[Scope]
 
+        def walk(children):
+            for child in children or []:
+                child_type, child_id = child.get('type', ''), child.get('name', '')
+                name = child.get('displayName') or child_id
+                if child_type.endswith('/managementGroups'):
+                    mgs.append(Scope(f"/providers/Microsoft.Management/managementGroups/{child_id}",
+                                     name, 'Management Group'))
+                    walk(child.get('children'))
+                elif child_type == '/subscriptions':
+                    subs.append(Scope(f"/subscriptions/{child_id}", name, 'Subscription',
+                                      subscription_id=child_id))
 
-class PIMClient:
-    """Client for Azure PIM (Privileged Identity Management) operations."""
-    
-    def __init__(self, api_client: AzureAPIClient):
-        """Initialize PIM client."""
-        self.api_client = api_client
-        self._pim_available = None  # Cache PIM availability status
-    
-    def get_eligible_assignments_for_scope(self, scope: Scope) -> List[Dict]:
-        """Get eligible role assignments (PIM) for a specific scope.
-        
-        Args:
-            scope: Scope to scan
-            
-        Returns:
-            List of eligible assignment data dictionaries
-        """
-        eligibility_data = []
-        
-        try:
-            # Azure PIM API endpoint for eligible role assignments
-            url = (f"{ARAConfig.AZURE_MANAGEMENT_URL}{scope.scope_path}/"
-                   f"providers/Microsoft.Authorization/roleEligibilityScheduleInstances"
-                   f"?api-version=2020-10-01")
-            
-            data = self.api_client._make_request(url)
-            
-            for eligibility in data.get('value', []):
-                # Extract the scope from the eligibility
-                props = eligibility.get('properties', {})
-                eligibility_scope = props.get('scope', '').lower()
-                
-                # Only include eligible assignments directly assigned to this scope
-                if eligibility_scope != scope.scope_path.lower():
-                    continue
-                
-                eligibility_data.append(eligibility)
-            
-            # Mark PIM as available if we got this far
-            if self._pim_available is None:
-                self._pim_available = True
-                
-        except Exception as e:
-            # It's common for scopes to not have PIM enabled, so we log at debug level
-            logger.debug(f"No eligible assignments or PIM not enabled for {scope.name}: {e}")
-            
-            # Mark PIM as unavailable on permission errors
-            if self._pim_available is None and ('403' in str(e) or '404' in str(e) or 'permission' in str(e).lower()):
-                self._pim_available = False
-        
-        return eligibility_data
-    
-    def get_time_bound_active_assignments_for_scope(self, scope: Scope) -> List[Dict]:
-        """Get active role assignment schedule instances (PIM) for a specific scope.
-        
-        This fetches ALL assignments from the roleAssignmentScheduleInstances API, which includes:
-        - Time-bound active assignments (PIM-activated with endDateTime)
-        - Permanent active assignments created via PIM (no endDateTime, typically service principals)
-        
-        Caller must check endDateTime to distinguish between permanent and time-bound.
-        
-        Args:
-            scope: Scope to scan
-            
-        Returns:
-            List of active assignment schedule data dictionaries
-        """
-        time_bound_data = []
-        
-        try:
-            # Azure PIM API endpoint for active role assignment schedules
-            url = (f"{ARAConfig.AZURE_MANAGEMENT_URL}{scope.scope_path}/"
-                   f"providers/Microsoft.Authorization/roleAssignmentScheduleInstances"
-                   f"?api-version=2020-10-01")
-            
-            data = self.api_client._make_request(url)
-            
-            for assignment in data.get('value', []):
-                # Extract the scope from the assignment
-                props = assignment.get('properties', {})
-                assignment_scope = props.get('scope', '').lower()
-                
-                # Only include assignments directly assigned to this scope
-                if assignment_scope != scope.scope_path.lower():
-                    continue
-                
-                time_bound_data.append(assignment)
-                
-        except Exception as e:
-            # It's common for scopes to not have PIM enabled, so we log at debug level
-            logger.debug(f"No time-bound active assignments or PIM not enabled for {scope.name}: {e}")
-        
-        return time_bound_data
-    
-    def is_pim_available(self) -> Optional[bool]:
-        """Check if PIM is available based on previous API calls.
-        
-        Returns:
-            True if PIM is available, False if unavailable, None if not yet determined
-        """
-        return self._pim_available
+        walk(props.get('children'))
+        return mgs, subs
 
+    def subscription(self, subscription_id: str) -> Scope:
+        """The subscription with its display name. APIError passes through."""
+        data = self.api.get(self.api.url(f"/subscriptions/{subscription_id}"),
+                            {"api-version": ARAConfig.AZURE_API_VERSION})
+        self.tenant_id = data.get('tenantId')
+        return Scope(f"/subscriptions/{subscription_id}", data.get('displayName') or subscription_id,
+                     'Subscription', subscription_id=subscription_id)
 
-class ResourceGroupClient:
-    """Client for Azure Resource Group operations."""
-    
-    def __init__(self, api_client: AzureAPIClient):
-        """Initialize resource group client."""
-        self.api_client = api_client
-        self._resource_group_cache = {}
-    
-    @functools.lru_cache(maxsize=ARAConfig.CACHE_SIZE_LIMIT)
-    def list_resource_groups(self, subscription_id: str) -> List[Scope]:
-        """List all resource groups in a subscription."""
-        if subscription_id in self._resource_group_cache:
-            return self._resource_group_cache[subscription_id]
-        
-        resource_groups = []
-        try:
-            url = (f"{ARAConfig.AZURE_MANAGEMENT_URL}/subscriptions/{subscription_id}/"
-                   f"resourcegroups?api-version={ARAConfig.RESOURCE_API_VERSION}")
-            
-            data = self.api_client._make_request(url)
-            
-            for rg in data.get('value', []):
-                rg_name = rg.get('name', 'Unknown')
-                rg_path = rg.get('id', f"/subscriptions/{subscription_id}/resourceGroups/{rg_name}")
-                
-                scope = Scope(
-                    scope_path=rg_path,
-                    name=rg_name,
-                    scope_type='Resource Group',
-                    depth=0
-                )
-                resource_groups.append(scope)
-            
-            self._resource_group_cache[subscription_id] = resource_groups
-            logger.debug(f"Found {len(resource_groups)} resource groups in subscription {subscription_id}")
-            
-        except Exception as e:
-            logger.warning(f"Error listing resource groups for subscription {subscription_id}: {e}")
-        
-        return resource_groups
-
-
-class ResourceClient:
-    """Client for Azure Resource operations."""
-    
-    def __init__(self, api_client: AzureAPIClient):
-        """Initialize resource client."""
-        self.api_client = api_client
-        self._resource_cache = {}
-    
-    def list_resources(self, subscription_id: str, resource_group_name: str, 
-                       resource_type_filter: Optional[List[str]] = None) -> List[Scope]:
-        """List all resources in a resource group with optional type filtering."""
-        cache_key = f"{subscription_id}/{resource_group_name}"
-        if cache_key in self._resource_cache:
-            cached_resources = self._resource_cache[cache_key]
-            if resource_type_filter:
-                return [r for r in cached_resources if r.resource_type in resource_type_filter]
-            return cached_resources
-        
-        resources = []
-        try:
-            url = (f"{ARAConfig.AZURE_MANAGEMENT_URL}/subscriptions/{subscription_id}/"
-                   f"resourceGroups/{resource_group_name}/resources"
-                   f"?api-version={ARAConfig.RESOURCE_API_VERSION}")
-            
-            data = self.api_client._make_request(url)
-            
-            for resource in data.get('value', []):
-                resource_name = resource.get('name', 'Unknown')
-                resource_id = resource.get('id', '')
-                resource_type = resource.get('type', 'Unknown')
-                
-                scope = Scope(
-                    scope_path=resource_id,
-                    name=resource_name,
-                    scope_type='Resource',
-                    depth=0,
-                    resource_type=resource_type
-                )
-                resources.append(scope)
-            
-            self._resource_cache[cache_key] = resources
-            logger.debug(f"Found {len(resources)} resources in {resource_group_name}")
-            
-        except Exception as e:
-            logger.warning(f"Error listing resources for {resource_group_name}: {e}")
-        
-        # Apply filter if specified
-        if resource_type_filter:
-            resources = [r for r in resources if r.resource_type in resource_type_filter]
-        
-        return resources
-
-
-class GraphAPIClient:
-    """Client for Microsoft Graph API operations."""
-    
-    def __init__(self):
-        """Initialize Graph API client."""
-        self.token = None
-        self._principal_cache = {}
-        self._graph_token_fetched = False
-    
-    def _get_graph_token(self) -> Optional[str]:
-        """Get Graph API token from Azure CLI."""
-        if self._graph_token_fetched:
-            return self.token
-        
-        try:
-            # Get Graph API token specifically
-            cmd = ['az', 'account', 'get-access-token', '--resource', 'https://graph.microsoft.com']
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=ARAConfig.TOKEN_VALIDATION_TIMEOUT
-            )
-            
-            if result.returncode == 0:
-                token_data = json.loads(result.stdout)
-                self.token = token_data.get('accessToken')
-                self._graph_token_fetched = True
-                logger.debug("Successfully obtained Graph API token")
-                return self.token
-            else:
-                logger.debug(f"Failed to get Graph token: {result.stderr}")
-                self._graph_token_fetched = True
-                return None
-                
-        except Exception as e:
-            logger.debug(f"Could not get Graph API token: {e}")
-            self._graph_token_fetched = True
+    def tenant(self) -> Optional[Dict[str, Optional[str]]]:
+        """Name and default domain of the tenant of the root that was read; never fails the scan."""
+        if not self.tenant_id:
             return None
-    
-    def get_principal_display_name(self, principal_id: str, principal_type: str) -> str:
-        """Get the display name for a principal."""
-        # Check cache first
-        if principal_id in self._principal_cache:
-            return self._principal_cache[principal_id]
-        
-        # Try to fetch from Graph API
         try:
-            display_name = self._fetch_principal_name(principal_id, principal_type)
-            self._principal_cache[principal_id] = display_name
-            return display_name
-        except Exception as e:
-            logger.debug(f"Could not resolve principal {principal_id}: {e}")
-            # Fallback to "Unknown" (matches Azure Portal behavior)
-            self._principal_cache[principal_id] = "Unknown"
-            return "Unknown"
-    
-    def _fetch_principal_name(self, principal_id: str, principal_type: str) -> str:
-        """Fetch principal name from Graph API."""
-        # Get Graph token if not already obtained
-        token = self._get_graph_token()
-        if not token:
-            # No token available, return ID
-            return principal_id
-        
-        # Endpoint mapping based on principal type
-        endpoint_map = {
-            'User': 'users',
-            'Group': 'groups',
-            'ServicePrincipal': 'servicePrincipals'
-        }
-        
-        endpoint = endpoint_map.get(principal_type, 'directoryObjects')
-        url = f"{ARAConfig.GRAPH_API_URL}/{endpoint}/{principal_id}"
-        
-        headers = {
-            'Authorization': f'Bearer {token}',
-            'Content-Type': 'application/json',
-        }
-        
+            rows = self.api.get_all(self.api.url("/tenants"), {"api-version": ARAConfig.TENANT_API_VERSION})
+        except ARAError as e:
+            logger.debug(f"Tenant name not read: {e}")
+            rows = []
+        for t in rows:
+            if (t.get('tenantId') or '').lower() == self.tenant_id.lower():
+                return {"id": t['tenantId'], "name": t.get('displayName'), "domain": t.get('defaultDomain')}
+        return {"id": self.tenant_id, "name": None, "domain": None}
+
+
+class AssignmentCollector:
+    """Lists role assignments once per management group or subscription, and role names per scope."""
+
+    def __init__(self, api: AzureAPIClient):
+        self.api = api
+
+    def _list(self, scope_path: str, kind: str, params: Dict) -> List[Dict]:
+        params = dict(params, **{"api-version": ARAConfig.AUTH_API_VERSION})
+        return self.api.get_all(self.api.url(f"{scope_path}/providers/Microsoft.Authorization/{kind}"), params)
+
+    @staticmethod
+    def inside(scope_path: str, container_path: str) -> bool:
+        """True when scope_path is container_path or below it, ignoring case."""
+        scope, container = scope_path.lower(), container_path.lower().rstrip('/')
+        return scope == container or scope.startswith(container + '/')
+
+    def for_management_group(self, mg: Scope) -> List[Dict]:
+        rows = self._list(mg.scope_path, "roleAssignments", {"$filter": "atScope()"})
+        return [r for r in rows if r.get('properties', {}).get('scope', '').lower() == mg.scope_path.lower()]
+
+    def for_subscription(self, sub: Scope) -> List[Dict]:
+        rows = self._list(sub.scope_path, "roleAssignments", {})
+        return [r for r in rows if self.inside(r.get('properties', {}).get('scope', ''), sub.scope_path)]
+
+    def role_names(self, scope_path: str) -> Dict[str, str]:
+        """Role definition GUID (lowercase) to role name."""
+        return {d['id'].rsplit('/', 1)[-1].lower(): d['properties']['roleName']
+                for d in self._list(scope_path, "roleDefinitions", {})}
+
+
+class DepthFilter:
+    """Decides whether a scope falls within the scan depth and resource type filter."""
+    _LEVEL = {'Management Group': 0, 'Subscription': 1, 'Resource Group': 2, 'Resource': 3}
+    _MAX_LEVEL = {ARAConfig.DEPTH_MANAGEMENT_GROUPS: 0, ARAConfig.DEPTH_SUBSCRIPTIONS: 1,
+                  ARAConfig.DEPTH_RESOURCE_GROUPS: 2, ARAConfig.DEPTH_RESOURCES: 3}
+
+    @staticmethod
+    def keep(scope: Scope, depth: str, resource_types: Optional[List[str]]) -> bool:
+        if DepthFilter._LEVEL[scope.scope_type] > DepthFilter._MAX_LEVEL[depth]:
+            return False
+        if scope.scope_type == 'Resource' and resource_types:
+            return scope.resource_type.lower() in [t.lower() for t in resource_types]
+        return True
+
+
+class PIMCollector:
+    """Lists PIM eligible and active schedule instances once per management group or subscription."""
+
+    def __init__(self, api: AzureAPIClient):
+        self.api = api
+
+    def _list(self, scope: Scope, kind: str) -> List[Dict]:
+        mg = scope.scope_type == 'Management Group'
+        params = {"api-version": ARAConfig.PIM_API_VERSION}
+        if mg:
+            params["$filter"] = "atScope()"
         try:
-            request = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(request, timeout=ARAConfig.API_REQUEST_TIMEOUT) as response:
-                data = json.loads(response.read().decode())
-                display_name = data.get('displayName', data.get('userPrincipalName', 'Unknown'))
-                logger.debug(f"Resolved {principal_id} -> {display_name}")
-                return display_name
-                
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode() if hasattr(e, 'read') else ''
-            logger.debug(f"Graph API HTTP error for {principal_id}: {e.code} - {error_body}")
-            return "Unknown"
-        except Exception as e:
-            logger.debug(f"Graph API error for {principal_id}: {e}")
-            return "Unknown"
+            rows = self.api.get_all(self.api.url(f"{scope.scope_path}/providers/Microsoft.Authorization/{kind}"), params)
+        except APIError as e:
+            if e.status == 403:
+                raise PIMUnavailable(str(e)) from e
+            raise
+        at = lambda r: r.get('properties', {}).get('scope', '')
+        if mg:
+            return [r for r in rows if at(r).lower() == scope.scope_path.lower()]
+        return [r for r in rows if AssignmentCollector.inside(at(r), scope.scope_path)]
+
+    def eligible(self, scope: Scope) -> List[Dict]:
+        return self._list(scope, "roleEligibilityScheduleInstances")
+
+    def active(self, scope: Scope) -> List[Dict]:
+        return self._list(scope, "roleAssignmentScheduleInstances")
+
+
+class AssignmentBuilder:
+    """Turns RBAC rows and PIM schedule instances into RoleAssignments."""
+
+    def __init__(self, role_names: Dict[str, str], subscription_names: Dict[str, str],
+                 management_group_names: Optional[Dict[str, str]] = None):
+        self.role_names = role_names  # lowercased role definition GUID to name
+        self.subscription_names = subscription_names  # lowercased subscription GUID to display name
+        self.management_group_names = management_group_names or {}  # lowercased management group id to display name
+
+    def build(self, rbac_rows: List[Dict], active_instances: Optional[List[Dict]],
+              eligible_instances: Optional[List[Dict]]) -> List[RoleAssignment]:
+        """None for the instance lists means PIM was skipped or unavailable."""
+        by_origin = {}  # type: Dict[str, Dict]
+        for i in active_instances or []:
+            origin = i.get('properties', {}).get('originRoleAssignmentId')
+            if origin:
+                by_origin[origin.lower()] = i['properties']
+        out = []  # type: List[RoleAssignment]
+        for r in rbac_rows:
+            inst = by_origin.get(r.get('id', '').lower(), {})
+            kind = ('Active time-bound' if inst.get('endDateTime') else 'Active permanent') if inst else 'Active'
+            self._add(out, r, r.get('properties', {}), inst, kind)
+        for e in eligible_instances or []:
+            p = e.get('properties', {})
+            self._add(out, e, p, p, 'Eligible time-bound' if p.get('endDateTime') else 'Eligible permanent')
+        return out
+
+    def _add(self, out: List[RoleAssignment], item: Dict, props: Dict, inst: Dict, kind: str) -> None:
+        """item is the source row; props gives principal, role and scope; inst (a schedule instance, or {}) gives names and dates."""
+        expanded = inst.get('expandedProperties') or {}
+        role_id = props.get('roleDefinitionId', '')
+        guid = role_id.rsplit('/', 1)[-1]
+        try:
+            scope = Scope.from_path(props.get('scope', ''))
+            name = scope.name
+            if scope.scope_type == 'Subscription':
+                name = self.subscription_names.get(scope.subscription_id.lower()) or name
+            elif scope.scope_type == 'Management Group':
+                name = self.management_group_names.get(name.lower()) or name
+            out.append(RoleAssignment(
+                principal_id=props.get('principalId', ''),
+                principal_name=(expanded.get('principal') or {}).get('displayName') or None,
+                principal_type=props.get('principalType', 'Unknown'),
+                role_name=self.role_names.get(guid.lower()) or (expanded.get('roleDefinition') or {}).get('displayName') or guid,
+                role_id=role_id, scope=scope.scope_path, scope_name=name, scope_type=scope.scope_type,
+                resource_type=scope.resource_type, assignment_type=kind,
+                start_date_time=inst.get('startDateTime'), end_date_time=inst.get('endDateTime')))
+        except ValidationError as e:
+            logger.warning(f"Skipping assignment {item.get('id') or props.get('scope')}: {e}")
+
+
+class Scanner:
+    """Walks the management groups and subscriptions under a scope and collects their assignments."""
+
+    def __init__(self, hierarchy: HierarchyClient, collector: AssignmentCollector,
+                 pim: Optional[PIMCollector], show_progress: bool = True):
+        self.hierarchy = hierarchy
+        self.collector = collector
+        self.pim = pim  # None means --skip-pim
+        self.show_progress = show_progress
+
+    def resolve(self, ref: ScopeRef) -> ScopeRef:
+        """A bare GUID is a subscription, or a management group when no such subscription exists."""
+        if ref.kind != 'guid':
+            return ref
+        try:
+            self.hierarchy.subscription(ref.name)
+            return ScopeRef(ref.path, 'subscription', ref.name)
+        except APIError as e:
+            if e.status != 404:
+                raise
+            return ScopeRef(f"/providers/Microsoft.Management/managementGroups/{ref.name}", 'management-group', ref.name)
+
+    def scan(self, ref: ScopeRef, depth: str, resource_types: Optional[List[str]] = None) -> ScanResult:
+        """Errors reading the root scope are raised; after that, a ScanResult is always returned."""
+        timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        if ref.kind == 'management-group':
+            mgs, subs = self.hierarchy.management_group_tree(ref.name)
+        else:
+            mgs, subs = [], [self.hierarchy.subscription(ref.name)]
+        root = (mgs or subs)[0]  # the scanned scope; its name is the display name when Azure gave one
+        name = root.name if ScopeParser._GUID_RE.match(ref.name) else ref.name
+        result = ScanResult(ref.path, name, depth, timestamp, [], pim_skipped=self.pim is None)
+        result.tenant = getattr(self.hierarchy, "tenant", lambda: None)()
+        sub_names = {s.subscription_id.lower(): s.name for s in subs}
+        mg_names = {m.scope_path.rsplit('/', 1)[-1].lower(): m.name for m in mgs}
+        scopes = mgs + ([] if depth == ARAConfig.DEPTH_MANAGEMENT_GROUPS else subs)
+        try:
+            with ProgressTracker(total=len(scopes), desc="Scanning scopes", disable=not self.show_progress) as progress:
+                for scope in scopes:
+                    try:
+                        self._scan_one(scope, depth, resource_types, sub_names, mg_names, result)
+                    except APIError as e:
+                        result.failed_scopes.append({"scope": scope.scope_path, "error": str(e)})
+                    progress.update(1)
+        except AuthenticationError as e:
+            logger.error(f"Scan stopped: {e}")
+            result.stopped = True
+        except KeyboardInterrupt:
+            logger.warning("Interrupted. Writing what was read so far.")
+            result.interrupted = True
+        result.assignments_before_filters = len(result.assignments)
+        return result
+
+    def _scan_one(self, scope: Scope, depth: str, resource_types: Optional[List[str]],
+                  sub_names: Dict[str, str], mg_names: Dict[str, str], result: ScanResult) -> None:
+        is_mg = scope.scope_type == 'Management Group'
+        role_names = self.collector.role_names(scope.scope_path)
+        rows = self.collector.for_management_group(scope) if is_mg else self.collector.for_subscription(scope)
+        active = eligible = None  # type: Optional[List[Dict]]
+        if self.pim:
+            refused = False
+            try:
+                eligible = self.pim.eligible(scope)
+            except PIMUnavailable:
+                refused = True
+            try:
+                active = self.pim.active(scope)
+            except PIMUnavailable:
+                refused = True
+            if refused:
+                if not result.pim_unavailable_scopes:
+                    logger.warning("PIM data is not readable with this account; affected assignments get the type 'Active'.")
+                result.pim_unavailable_scopes.append(scope.scope_path)
+        built = AssignmentBuilder(role_names, sub_names, mg_names).build(rows, active, eligible)
+        result.assignments.extend(a for a in built if DepthFilter.keep(Scope.from_path(a.scope), depth, resource_types))
+        if is_mg:
+            result.management_groups_scanned += 1
+        else:
+            result.subscriptions_scanned += 1
+
+
+class GraphAPIClient(HttpClient):
+    """HttpClient for Microsoft Graph."""
+    IDS_PER_CALL = 1000  # getByIds limit
+
+    @classmethod
+    def create(cls, az_token: Callable[[], Optional[str]]) -> Optional['GraphAPIClient']:
+        """Token from AZURE_GRAPH_TOKEN, else from az_token(); None when neither gives one."""
+        env_token = os.environ.get('AZURE_GRAPH_TOKEN')
+        token = env_token or az_token()
+        return cls(token, refresh_token=None if env_token else az_token) if token else None
+
+    def get_by_ids(self, ids: List[str]) -> Dict[str, Dict]:
+        """Look up users, groups and service principals; maps lowercased id to the returned object."""
+        found = {}  # type: Dict[str, Dict]
+        for i in range(0, len(ids), self.IDS_PER_CALL):
+            page = self.request("POST", f"{ARAConfig.GRAPH_API_URL}/directoryObjects/getByIds",
+                                body={"ids": ids[i:i + self.IDS_PER_CALL], "types": ["user", "group", "servicePrincipal"]})
+            found.update((obj["id"].lower(), obj) for obj in page.get("value", []) if obj.get("id"))
+        return found
+
+
+class PrincipalResolver:
+    """Fills principal names: PIM names first, then Microsoft Graph in batches."""
+
+    def __init__(self, graph: Optional[GraphAPIClient]):
+        self.graph = graph
+        self.asked_graph = False  # True once a Graph lookup succeeded
+
+    def resolve(self, assignments: List[RoleAssignment]) -> Tuple[List[RoleAssignment], str]:
+        """Return the assignments with names filled in, and the names status."""
+        if self.graph is None:
+            logger.warning("No Microsoft Graph token. Principal names come from PIM only.")
+        else:
+            try:
+                found = self.graph.get_by_ids(sorted({a.principal_id.lower() for a in assignments}))
+            except ARAError as e:
+                logger.warning(f"Microsoft Graph lookup failed: {e}. Principal names come from PIM only.")
+            else:
+                self.asked_graph = True
+                return [self._apply(a, found.get(a.principal_id.lower())) for a in assignments], "resolved"
+        named = sum(1 for a in assignments if a.principal_name)
+        return assignments, "resolved" if named == len(assignments) else "unavailable" if named == 0 else "partial"
+
+    @staticmethod
+    def _apply(assignment: RoleAssignment, obj: Optional[Dict]) -> RoleAssignment:
+        if obj is None:
+            return assignment if assignment.principal_name else replace(assignment, principal_name="Unknown")
+        principal_type = 'ManagedIdentity' if obj.get('servicePrincipalType') == 'ManagedIdentity' else assignment.principal_type
+        return replace(assignment, principal_name=obj.get('displayName') or assignment.principal_name,
+                       principal_type=principal_type, principal_upn=obj.get('userPrincipalName'))
 
 
 # Output Handlers
 class OutputHandler(ABC):
-    """Abstract base class for output handlers."""
-    
+    """Renders a ScanResult to text and writes it atomically into the output directory."""
+    extension: str
+
+    def __init__(self, output_dir: str):
+        self.output_dir = output_dir
+
     @abstractmethod
-    def generate(self, results: ScanResult, **kwargs) -> None:
-        """Generate output in specific format."""
+    def render(self, results: ScanResult) -> str:
         pass
 
+    def file_name(self, results: ScanResult) -> str:
+        t = results.tenant or {}
+        label = (t.get("domain") or "").split(".")[0] or t.get("name") or ""
+        safe = re.sub(r'[^A-Za-z0-9_-]', '_', (label + "_" if label else "") + results.scope_name)
+        partial = "" if results.complete else ".partial"
+        return f"role_assignments_{safe}{partial}.{self.extension}"
 
-class SummaryOutputHandler(OutputHandler):
-    """Generate console summary output."""
-    
-    def generate(self, results: ScanResult, **kwargs) -> None:
-        """Generate detailed summary output."""
-        safe_print("\n" + "="*ARAConfig.SEPARATOR_LENGTH)
-        safe_print(f"📋 SUMMARY: Found {results.total_assignments_found} role assignments "
-                  f"across {results.total_scopes_scanned} scopes")
-        safe_print("="*ARAConfig.SEPARATOR_LENGTH)
-        
-        if not results.assignments:
-            safe_print("❌ No role assignments found.")
-            return
-        
-        # Group by role
-        by_role = {}
-        for assignment in results.assignments:
-            if assignment.role_name not in by_role:
-                by_role[assignment.role_name] = []
-            by_role[assignment.role_name].append(assignment)
-        
-        for role_name in sorted(by_role.keys()):
-            assignments = by_role[role_name]
-            safe_print(f"\n👤 Role: {role_name} ({len(assignments)} assignments)")
-            safe_print("-" * ARAConfig.SUBSECTION_SEPARATOR_LENGTH)
-            
-            for assignment in assignments[:5]:  # Show top 5
-                safe_print(f"   • {assignment.principal_name} ({assignment.principal_type})")
-                scope_display = f"     Scope: {assignment.scope_name} ({assignment.scope_type})"
-                if assignment.resource_type:
-                    scope_display += f" - {assignment.resource_type}"
-                safe_print(scope_display)
-            
-            if len(assignments) > 5:
-                safe_print(f"   ... and {len(assignments) - 5} more")
-        
-        safe_print()
+    def generate(self, results: ScanResult) -> str:
+        path = os.path.join(self.output_dir, self.file_name(results))
+        text = self.render(results)
+        try:
+            os.makedirs(self.output_dir, exist_ok=True)
+            with open(path + ".tmp", 'w', encoding='utf-8', newline='') as f:
+                f.write(text)
+            os.replace(path + ".tmp", path)
+        except OSError as e:
+            try:
+                os.remove(path + ".tmp")
+            except OSError:
+                pass
+            raise ExportError(f"Failed to write {path}: {e}")
+        return path
 
 
 class JSONOutputHandler(OutputHandler):
-    """Generate JSON output."""
-    
-    def __init__(self, results_dir: str = ARAConfig.RESULTS_DIR):
-        """Initialize JSON handler."""
-        self.results_dir = results_dir
-        os.makedirs(self.results_dir, exist_ok=True)
-    
-    def generate(self, results: ScanResult, filename: Optional[str] = None, **kwargs) -> str:
-        """Write results to JSON file."""
-        output_data = self._build_json_structure(results)
-        
-        if not filename:
-            # Extract management group ID from scope
-            parts = results.scope.split('/')
-            mg_id = parts[-1] if parts else "unknown"
-            filename = f"role_assignments_{mg_id}.json"
-        
-        filepath = os.path.join(self.results_dir, filename)
-        
-        try:
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(output_data, f, indent=ARAConfig.JSON_INDENT, ensure_ascii=False)
-            logger.info(f"💾 JSON results saved to: {filepath}")
-            return filepath
-        except (OSError, TypeError, ValueError) as e:
-            raise ExportError(f"Failed to write JSON file: {e}")
-    
-    def _build_json_structure(self, results: ScanResult) -> Dict:
-        """Build JSON output structure."""
-        metadata = {
-            "tool": "Azure Role Assignment Exporter (ARA)",
-            "version": __version__,
-            "scan_timestamp": results.scan_timestamp,
-            "scope": results.scope,
-            "total_scopes_scanned": results.total_scopes_scanned,
-            "total_assignments_found": results.total_assignments_found
-        }
-        
-        # Add filter information if filters were applied
-        if results.filters_applied:
-            metadata["filters_applied"] = results.filters_applied
-        
-        return {
-            "metadata": metadata,
-            "scopes_scanned": [
-                {
-                    "scope_path": scope.scope_path,
-                    "name": scope.name,
-                    "type": scope.scope_type,
-                    "depth": scope.depth
-                }
-                for scope in results.scanned_scopes
-            ],
-            "role_assignments": [
-                {
-                    "principal_id": assignment.principal_id,
-                    "principal_name": assignment.principal_name,
-                    "principal_type": assignment.principal_type,
-                    "role_name": assignment.role_name,
-                    "role_id": assignment.role_id,
-                    "scope": assignment.scope,
-                    "scope_name": assignment.scope_name,
-                    "scope_type": assignment.scope_type,
-                    "resource_type": assignment.resource_type,
-                    "assignment_type": assignment.assignment_type,
-                    "start_date_time": assignment.start_date_time,
-                    "end_date_time": assignment.end_date_time
-                }
-                for assignment in results.assignments
-            ]
-        }
+    extension = "json"
+
+    def render(self, results: ScanResult) -> str:
+        return json.dumps(results.to_dict(), indent=ARAConfig.JSON_INDENT, ensure_ascii=False)
 
 
 class CSVOutputHandler(OutputHandler):
-    """Generate CSV output."""
-    
-    def __init__(self, results_dir: str = ARAConfig.RESULTS_DIR):
-        """Initialize CSV handler."""
-        self.results_dir = results_dir
-        os.makedirs(self.results_dir, exist_ok=True)
-    
-    def generate(self, results: ScanResult, filename: Optional[str] = None, **kwargs) -> str:
-        """Write results to CSV file."""
-        if not filename:
-            # Extract management group ID from scope
-            parts = results.scope.split('/')
-            mg_id = parts[-1] if parts else "unknown"
-            filename = f"role_assignments_{mg_id}.csv"
-        
-        filepath = os.path.join(self.results_dir, filename)
-        
-        # Check if any assignments have resource_type (for conditional column)
-        has_resource_types = any(a.resource_type for a in results.assignments)
-        
-        try:
-            with open(filepath, 'w', newline='', encoding=ARAConfig.CSV_ENCODING) as f:
-                fieldnames = ['Name', 'Principal ID', 'Type', 'Role', 'Scope', 'Scope Type', 'Assignment Type']
-                if has_resource_types:
-                    fieldnames.append('Resource Type')
-                fieldnames.extend(['Start Date', 'End Date'])
-                
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writeheader()
-                
-                for assignment in sorted(results.assignments, key=lambda x: x.role_name):
-                    row = {
-                        'Name': assignment.principal_name,
-                        'Principal ID': assignment.principal_id,
-                        'Type': assignment.principal_type,
-                        'Role': assignment.role_name,
-                        'Scope': assignment.scope_name,
-                        'Scope Type': assignment.scope_type,
-                        'Assignment Type': assignment.assignment_type
-                    }
-                    if has_resource_types:
-                        row['Resource Type'] = assignment.resource_type or ''
-                    row['Start Date'] = assignment.start_date_time or ''
-                    row['End Date'] = assignment.end_date_time or ''
-                    writer.writerow(row)
-            
-            logger.info(f"💾 CSV results saved to: {filepath}")
-            return filepath
-        except (OSError, csv.Error) as e:
-            raise ExportError(f"Failed to write CSV file: {e}")
+    extension = "csv"
+    COLUMNS = ("Name", "Principal ID", "Type", "Role", "Scope", "Scope Path", "Scope Type",
+               "Assignment Type", "Resource Type", "Start Date", "End Date")
+
+    @staticmethod
+    def escape(value: Optional[str]) -> str:
+        """Neutralise spreadsheet formula injection."""
+        if value is None:
+            return ""
+        return "'" + value if value[:1] in ("=", "+", "-", "@") else value
+
+    def render(self, results: ScanResult) -> str:
+        buf = io.StringIO()
+        writer = csv.writer(buf, lineterminator="\n")
+        writer.writerow(self.COLUMNS)
+        for a in results.assignments:
+            writer.writerow([self.escape(v) for v in (
+                a.principal_name, a.principal_id, a.principal_type, a.role_name, a.scope_name, a.scope,
+                a.scope_type, a.assignment_type, a.resource_type, a.start_date_time, a.end_date_time)])
+        return buf.getvalue()
+
+
+# Self-contained report page. Plain string: CSS and JS braces need no escaping; /*ARA_DATA*/ is replaced once.
+REPORT_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Azure role assignments exported by ARA.">
+<link rel="icon" href="data:,">
+<title>ARA report</title>
+<style>
+:root {
+  color-scheme: light;
+  --color-paper: oklch(97.2% 0.006 95);
+  --color-paper-2: oklch(94.6% 0.008 95);
+  --color-raised: oklch(99% 0.004 95);
+  --color-ink: oklch(22% 0.012 95);
+  --color-muted: oklch(48% 0.012 95);
+  --color-edge: oklch(62% 0.012 95);
+  --color-rule: oklch(88.5% 0.01 95);
+  --color-accent: oklch(47% 0.1 175);
+  --color-accent-ink: oklch(98.5% 0.008 175);
+  --color-focus: oklch(49% 0.11 175);
+  --color-risk: oklch(50% 0.17 32);
+  --color-notice: oklch(94% 0.035 80);
+  --color-selection: oklch(88% 0.05 175);
+  --weight-body: 400;
+  --font-body: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --text-sm: 0.8333rem;
+  --text-md: 1rem;
+  --text-lg: 1.2rem;
+  --text-xl: 1.44rem;
+  --text-2xl: 1.728rem;
+  --space-3xs: 2px;
+  --space-2xs: 4px;
+  --space-xs: 8px;
+  --space-sm: 12px;
+  --space-md: 16px;
+  --space-lg: 24px;
+  --space-xl: 40px;
+  --space-2xl: 64px;
+  --radius-control: 6px;
+  --radius-well: 10px;
+  --control-h: 2.5rem;
+  --dur-micro: 120ms;
+  --dur-exit: 300ms;
+  --dur-long: 420ms;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in: cubic-bezier(0.7, 0, 0.84, 0);
+  --z-panel: 400;
+}
+/* Dark: same hues, re-derived lightness. Screen only, so print keeps the light tokens. */
+@media screen and (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --color-paper: oklch(16% 0.01 95);
+    --color-paper-2: oklch(19% 0.012 95);
+    --color-raised: oklch(22% 0.012 95);
+    --color-ink: oklch(94% 0.008 95);
+    --color-muted: oklch(72% 0.012 95);
+    --color-edge: oklch(52% 0.012 95);
+    --color-rule: oklch(30% 0.01 95);
+    --color-accent: oklch(72% 0.08 175);
+    --color-accent-ink: oklch(18% 0.01 175);
+    --color-focus: oklch(74% 0.09 175);
+    --color-risk: oklch(72% 0.14 32);
+    --color-notice: oklch(30% 0.04 80);
+    --color-selection: oklch(38% 0.06 175);
+    --weight-body: 350;
+  }
+}
+@media screen {
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --color-paper: oklch(16% 0.01 95);
+    --color-paper-2: oklch(19% 0.012 95);
+    --color-raised: oklch(22% 0.012 95);
+    --color-ink: oklch(94% 0.008 95);
+    --color-muted: oklch(72% 0.012 95);
+    --color-edge: oklch(52% 0.012 95);
+    --color-rule: oklch(30% 0.01 95);
+    --color-accent: oklch(72% 0.08 175);
+    --color-accent-ink: oklch(18% 0.01 175);
+    --color-focus: oklch(74% 0.09 175);
+    --color-risk: oklch(72% 0.14 32);
+    --color-notice: oklch(30% 0.04 80);
+    --color-selection: oklch(38% 0.06 175);
+    --weight-body: 350;
+  }
+}
+*, *::before, *::after { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { overflow-x: clip; }
+html { scrollbar-color: var(--color-edge) var(--color-paper); }
+::selection { background: var(--color-selection); color: var(--color-ink); }
+body {
+  margin: 0;
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font: var(--text-md)/1.5 var(--font-body);
+  font-weight: var(--weight-body);
+}
+h1, h2, p, dl, dd, ul { margin: 0; }
+h1, h2 { font-weight: 600; line-height: 1.15; text-wrap: balance; overflow-wrap: break-word; min-width: 0; }
+.wrap { max-width: 85rem; margin-inline: auto; padding: var(--space-xl) var(--space-lg) var(--space-2xl); }
+
+.top { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: end; gap: var(--space-md) var(--space-xl); margin-bottom: var(--space-lg); }
+.top h1 { font-size: var(--text-xl); }
+.tenant { font-size: var(--text-sm); overflow-wrap: break-word; }
+.tenant .domain { color: var(--color-muted); margin-inline-start: var(--space-xs); }
+.scope { font-size: var(--text-lg); overflow-wrap: break-word; }
+.facts { margin-inline-start: auto; display: flex; flex-wrap: wrap; gap: var(--space-xs) var(--space-md); color: var(--color-muted); font-size: var(--text-sm); }
+.facts p + p { border-left: 1px solid var(--color-rule); padding-left: var(--space-md); }
+.risk { color: var(--color-risk); font-weight: 600; }
+
+.banner { background: var(--color-notice); border-radius: var(--radius-well); padding: var(--space-sm) var(--space-md); margin-bottom: var(--space-lg); display: grid; gap: var(--space-2xs); }
+.banner ul { padding-left: var(--space-md); font-size: var(--text-sm); overflow-wrap: anywhere; }
+
+.stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: var(--space-xl); }
+.stats div { display: flex; flex-direction: column-reverse; padding-inline: var(--space-lg); border-left: 1px solid var(--color-rule); }
+.stats div:first-child { padding-left: 0; border-left: 0; }
+.stats div:last-child { padding-right: 0; }
+.stats dt { font-size: var(--text-sm); color: var(--color-muted); }
+.stats dd { font-size: var(--text-2xl); font-weight: 600; line-height: 1.2; font-variant-numeric: tabular-nums; }
+
+.bar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-xs); margin-bottom: var(--space-sm); }
+.search {
+  flex: 1 1 18rem; min-width: 0; height: var(--control-h); padding-inline: var(--space-sm);
+  font: inherit; color: var(--color-ink); background: var(--color-raised);
+  border: 1px solid var(--color-edge); border-radius: var(--radius-control); caret-color: var(--color-accent);
+}
+.search::placeholder { color: var(--color-muted); }
+.search:focus-visible { outline: 2px solid var(--color-focus); outline-offset: -2px; }
+.btn {
+  position: relative; height: var(--control-h); padding-inline: var(--space-md);
+  font: inherit; font-size: var(--text-sm); white-space: nowrap; cursor: pointer;
+  color: var(--color-ink); background: transparent;
+  border: 1px solid var(--color-edge); border-radius: var(--radius-control);
+  transition: transform var(--dur-micro) var(--ease-out);
+}
+.btn::after { content: ""; position: absolute; inset: calc(-1 * var(--space-3xs)) 0; }
+.btn:hover { background: var(--color-paper-2); }
+.btn:active { transform: translateY(1px); }
+.btn:disabled { opacity: 0.55; cursor: not-allowed; }
+.btn[aria-pressed="true"] { background: var(--color-accent); border-color: var(--color-accent); color: var(--color-accent-ink); }
+.btn:focus-visible, .cell:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; }
+.count { color: var(--color-muted); font-size: var(--text-sm); margin-bottom: var(--space-xs); }
+
+.table-wrap { overflow-x: auto; }
+table { width: 100%; min-width: 48rem; border-collapse: collapse; }
+th { font-size: var(--text-sm); font-weight: 600; color: var(--color-muted); text-align: left; white-space: nowrap; padding: var(--space-xs) var(--space-sm); border-bottom: 1px solid var(--color-rule); }
+td { padding: var(--space-xs) var(--space-sm); border-bottom: 1px solid var(--color-rule); vertical-align: top; overflow-wrap: break-word; }
+th:first-child, td:first-child { position: sticky; left: 0; background: var(--color-paper); padding-left: 0; }
+tbody tr { cursor: pointer; }
+tbody tr:hover, tbody tr:hover td:first-child { background: var(--color-paper-2); }
+.cell {
+  display: flex; flex-direction: column; min-height: var(--control-h); padding: 0;
+  font: inherit; color: inherit; text-align: left; cursor: pointer;
+  background: none; border: 0; border-radius: var(--radius-control);
+}
+.cell:hover .main { text-decoration: underline; }
+.sub { display: block; color: var(--color-muted); font-size: var(--text-sm); }
+.none { color: var(--color-muted); }
+.more { margin-top: var(--space-md); }
+.empty { padding-block: var(--space-xl); display: grid; justify-items: start; gap: var(--space-sm); }
+
+.panel {
+  position: fixed; inset-block: 0; right: 0; width: min(28rem, 100%); overflow-y: auto; z-index: var(--z-panel);
+  background: var(--color-raised); color: var(--color-ink); border-left: 1px solid var(--color-rule); padding: var(--space-lg);
+  transform: translateX(100%); transition: transform var(--dur-exit) var(--ease-in);
+}
+.panel.open { transform: none; transition-duration: var(--dur-long); transition-timing-function: var(--ease-out); }
+.panel-head { display: flex; justify-content: space-between; align-items: start; gap: var(--space-md); }
+.panel h2 { font-size: var(--text-lg); }
+.panel-ref { display: flex; justify-content: space-between; align-items: center; gap: var(--space-sm); margin-top: var(--space-2xs); }
+.panel-id { color: var(--color-muted); font-size: var(--text-sm); overflow-wrap: anywhere; min-width: 0; }
+.panel ul { list-style: none; padding: 0; margin-top: var(--space-md); border-top: 1px solid var(--color-rule); }
+.panel li { padding-block: var(--space-sm); border-bottom: 1px solid var(--color-rule); }
+.panel li strong { display: block; font-weight: 600; overflow-wrap: break-word; }
+
+footer { margin-top: var(--space-xl); color: var(--color-muted); font-size: var(--text-sm); }
+
+@media (max-width: 60rem) {
+  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); row-gap: var(--space-lg); }
+  .stats div:nth-child(odd) { padding-left: 0; border-left: 0; }
+  .stats div:nth-child(even) { padding-right: 0; }
+}
+@media (max-width: 40rem) {
+  .wrap { padding-inline: var(--space-md); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .btn, .panel, .panel.open { transition: none; }
+}
+@media print {
+  .bar, .btn, .panel { display: none !important; }
+  .wrap { max-width: none; padding: 0; }
+  body, th:first-child, td:first-child { background: none; }
+  th:first-child, td:first-child { position: static; }
+  .table-wrap { overflow: visible; }
+  table { min-width: 0; }
+  tr { break-inside: avoid; }
+}
+</style>
+<script>
+"use strict";
+// Runs before first paint so a stored theme never flashes; the rest waits for the data block below.
+try {
+  const saved = localStorage.getItem("ara-theme");
+  if (saved === "light" || saved === "dark") document.documentElement.dataset.theme = saved;
+} catch (e) { /* storage blocked: follow the system theme */ }
+document.addEventListener("DOMContentLoaded", () => {
+  // Every tenant-supplied string goes through textContent or a text node, never through markup.
+  const data = JSON.parse(document.getElementById("ara-data").textContent);
+  const meta = data.metadata, report = data.report, rows = data.role_assignments;
+  const HIGH = new Set(report.high_privilege_roles);
+  const PAGE = 200;
+  const state = { q: "", chips: new Set(), list: rows, limit: PAGE, trigger: null, open: null };
+  const $ = (id) => document.getElementById(id);
+  const day = new Intl.DateTimeFormat(undefined, { year: "numeric", month: "short", day: "numeric" });
+  const stamp = new Intl.DateTimeFormat(undefined, { year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", timeZoneName: "short" });
+
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = text;
+    return e;
+  }
+  const plural = (n, one, many) => n + " " + (n === 1 ? one : many);
+  const when = (iso, fmt) => { const d = new Date(iso); return isNaN(d) ? iso : fmt.format(d); };
+  const who = (r) => r.principal_name || r.principal_id;
+  const scopeKind = (r) => r.resource_type || r.scope_type;
+  const high = (r) => HIGH.has(r.role_name);
+  const eligible = (r) => r.assignment_type.indexOf("Eligible") === 0;
+  const ends = (r) => r.end_date_time ? when(r.end_date_time, day) : (r.assignment_type === "Active" ? "Not known" : "No end date");
+  rows.forEach((r) => {
+    r.search = [r.principal_name, r.principal_upn, r.principal_id, r.role_name, r.scope_name, r.scope, r.principal_type,
+      r.scope_type, r.resource_type, r.assignment_type].filter(Boolean).join("\n").toLowerCase();
+  });
+
+  // Heading
+  const scopeName = report.scope_name;
+  $("scope").textContent = scopeName;
+  const tenant = meta.tenant;
+  if (tenant) {
+    $("tenant").append(el("span", null, tenant.name || tenant.id));
+    if (tenant.name && tenant.domain) $("tenant").append(el("span", "domain", tenant.domain));
+  }
+  document.title = "ARA " + (tenant && tenant.name ? tenant.name + " " : "") + scopeName;
+  const time = el("time", null, when(meta.scan_timestamp, stamp));
+  time.dateTime = meta.scan_timestamp;
+  $("scanned").append("Scanned ", time);
+  $("coverage").textContent = plural(meta.management_groups_scanned, "management group", "management groups") + ", " +
+    plural(meta.subscriptions_scanned, "subscription", "subscriptions") + ", depth " + meta.depth;
+  $("state").textContent = meta.complete ? "Scan complete" : "Scan incomplete";
+  if (!meta.complete) $("state").className = "risk";
+  $("about").textContent = "ARA " + meta.version + ", " + report.descriptor + ". " + report.slogan;
+
+  // Banner: one sentence per condition
+  const notes = [];
+  const failed = meta.failed_scopes.length;
+  if (failed) notes.push("The scan is incomplete: " + plural(failed, "scope", "scopes") + " could not be read.");
+  if (report.stopped) notes.push("The scan stopped before every scope was read.");
+  if (meta.pim === "skipped") notes.push("PIM was skipped: eligible assignments are not listed and every active assignment has the type Active.");
+  else if (meta.pim === "partial") notes.push("PIM data could not be read in full on " + plural(meta.pim_unavailable_scopes.length, "scope", "scopes") + ": eligible assignments there may be missing and active assignments may have the type Active.");
+  else if (meta.pim === "unavailable") notes.push("PIM data could not be read in full: eligible assignments may be missing and active assignments may have the type Active.");
+  if (meta.names === "partial") notes.push("Some principal names could not be read; those rows show the principal ID.");
+  else if (meta.names === "unavailable") notes.push("Principal names could not be read; rows show the principal ID.");
+  if (report.filters_not_applied) notes.push("Filters were not applied because principal names are incomplete; the report shows every assignment found.");
+  const filters = Object.keys(meta.filters_applied);
+  if (filters.length) notes.push("Filters were applied at scan time (" + filters.map((k) => k + ": " + meta.filters_applied[k]).join("; ") + "); the report shows only matching assignments.");
+  notes.forEach((n) => $("banner").appendChild(el("p", null, n)));
+  if (failed) {
+    // Scope paths and errors come from Azure: text only.
+    const list = el("ul");
+    meta.failed_scopes.slice(0, 10).forEach((f) => {
+      const error = f.error.length > 120 ? f.error.slice(0, 119) + "…" : f.error;
+      list.appendChild(el("li", null, f.scope + ": " + error));
+    });
+    if (failed > 10) list.appendChild(el("li", null, "and " + (failed - 10) + " more; the JSON file lists all of them."));
+    $("banner").insertBefore(list, $("banner").children[1] || null);
+  }
+  $("banner").hidden = notes.length === 0;
+
+  // Figures
+  const unknown = new Set(rows.filter((r) => r.principal_name === "Unknown").map((r) => r.principal_id)).size;
+  [[rows.length, "direct assignments", false],
+   [rows.filter(high).length, "high-privilege assignments", true],
+   [rows.filter(eligible).length, "eligible through PIM", false],
+   [unknown, "principals not found in the directory", true]].forEach(([n, label, warn]) => {
+    const box = el("div");
+    box.append(el("dt", null, label), el("dd", warn && n ? "risk" : null, String(n)));
+    $("stats").appendChild(box);
+  });
+
+  // Table
+  function cellButton(kind, main, sub) {
+    const b = el("button", "cell");
+    b.type = "button";
+    b.dataset.open = kind;
+    b.append(el("span", "main", main), el("span", "sub", sub));
+    return b;
+  }
+  function cell(...children) { const td = el("td"); td.append(...children); return td; }
+  function row(r) {
+    const tr = el("tr");
+    tr.record = r;
+    const end = r.end_date_time ? el("time", null, ends(r)) : el("span", "none", ends(r));
+    if (r.end_date_time) end.dateTime = r.end_date_time;
+    tr.append(
+      cell(cellButton("principal", who(r), r.principal_type)),
+      cell(el("span", high(r) ? "risk" : null, r.role_name)),
+      cell(cellButton("scope", r.scope_name, scopeKind(r))),
+      cell(r.assignment_type),
+      cell(end));
+    return tr;
+  }
+  function draw(from) {
+    const frag = document.createDocumentFragment();
+    state.list.slice(from, state.limit).forEach((r) => frag.appendChild(row(r)));
+    if (from === 0) $("rows").replaceChildren(frag); else $("rows").appendChild(frag);
+    const none = state.list.length === 0;
+    $("table").hidden = none;
+    $("empty").hidden = !none;
+    $("clear").hidden = rows.length === 0;
+    $("empty-text").textContent = rows.length ? "No assignments match the search and filters." : "This scan found no role assignments.";
+    $("more").hidden = state.list.length <= state.limit;
+  }
+  function update() {
+    state.list = rows.filter((r) => (!state.q || r.search.indexOf(state.q) !== -1) &&
+      (!state.chips.has("hp") || high(r)) &&
+      (!state.chips.has("el") || eligible(r)) &&
+      (!state.chips.has("us") || r.principal_type === "User"));
+    state.limit = PAGE;
+    $("count").textContent = state.list.length + " of " + rows.length + " assignments";
+    $("download").disabled = state.list.length === 0;
+    draw(0);
+    save();
+  }
+
+  // Shareable view: q, f and principal or scope live in the URL fragment.
+  function save() {
+    const p = new URLSearchParams();
+    if ($("search").value) p.set("q", $("search").value);
+    if (state.chips.size) p.set("f", Array.from(state.chips).join(","));
+    if (state.open) p.set(state.open.kind, state.open.key);
+    const hash = p.toString();
+    try { history.replaceState(null, "", hash ? "#" + hash : location.pathname + location.search); } catch (e) { /* view not kept in the address bar */ }
+  }
+  // The fragment is attacker-controllable: q only fills the search field, f only matches known chip ids,
+  // principal and scope are only compared to row values.
+  function restore() {
+    const p = new URLSearchParams(location.hash.slice(1));
+    const f = (p.get("f") || "").split(",");
+    $("search").value = p.get("q") || "";
+    state.q = $("search").value.trim().toLowerCase();
+    state.chips.clear();
+    document.querySelectorAll("[data-chip]").forEach((b) => {
+      const on = f.indexOf(b.dataset.chip) !== -1;
+      if (on) state.chips.add(b.dataset.chip);
+      b.setAttribute("aria-pressed", String(on));
+    });
+    update();
+    const pid = p.get("principal"), scope = p.get("scope");
+    const r = pid !== null ? rows.find((x) => x.principal_id === pid)
+      : scope !== null ? rows.find((x) => x.scope.toLowerCase() === scope.toLowerCase()) : undefined;
+    if (r) open(pid !== null ? "principal" : "scope", r, null); else close();
+  }
+
+  // Export what you see: same columns as the CSV file ARA writes.
+  const COLUMNS = ["Name", "Principal ID", "Type", "Role", "Scope", "Scope Path", "Scope Type", "Assignment Type", "Resource Type", "Start Date", "End Date"];
+  const KEYS = ["principal_name", "principal_id", "principal_type", "role_name", "scope_name", "scope", "scope_type", "assignment_type", "resource_type", "start_date_time", "end_date_time"];
+  function csvField(v) {
+    v = v === null || v === undefined ? "" : String(v);
+    if (/^[=+\-@]/.test(v)) v = "'" + v;  // neutralise spreadsheet formulas
+    return /[",\r\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
+  }
+  function download() {
+    const lines = [COLUMNS].concat(state.list.map((r) => KEYS.map((k) => r[k]))).map((l) => l.map(csvField).join(","));
+    const url = URL.createObjectURL(new Blob([lines.join("\r\n") + "\r\n"], { type: "text/csv" }));
+    const a = el("a");
+    a.href = url;
+    a.download = "role_assignments_" + scopeName.replace(/[^A-Za-z0-9_-]/g, "_") + "_filtered.csv";
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+  }
+
+  // Theme toggle: data-theme on <html> wins over the system preference.
+  const root = document.documentElement, systemDark = matchMedia("(prefers-color-scheme: dark)");
+  const isDark = () => (root.dataset.theme || (systemDark.matches ? "dark" : "light")) === "dark";
+  const themeLabel = () => { $("theme").textContent = isDark() ? "Light theme" : "Dark theme"; };
+
+  // Side panel
+  function open(kind, r, trigger) {
+    const byPrincipal = kind === "principal";
+    const items = byPrincipal ? rows.filter((x) => x.principal_id === r.principal_id)
+      : rows.filter((x) => x.scope.toLowerCase() === r.scope.toLowerCase());
+    $("panel-title").textContent = byPrincipal ? who(r) : r.scope_name;
+    $("panel-sub").textContent = (byPrincipal ? r.principal_type : scopeKind(r)) + ", " + plural(items.length, "assignment", "assignments");
+    $("panel-upn").textContent = byPrincipal && r.principal_upn ? r.principal_upn : "";
+    $("panel-upn").hidden = !$("panel-upn").textContent;
+    $("panel-id-label").hidden = !byPrincipal;
+    $("panel-id").textContent = byPrincipal ? r.principal_id : r.scope;
+    $("copy").textContent = "Copy";
+    const list = document.createDocumentFragment();
+    items.forEach((x) => {
+      const li = el("li");
+      const detail = (byPrincipal ? scopeKind(x) : x.principal_type) + ", " + x.assignment_type +
+        (x.end_date_time ? ", ends " + ends(x) : "");
+      li.append(el("strong", null, byPrincipal ? x.scope_name : who(x)), el("span", high(x) ? "risk" : null, x.role_name), el("span", "sub", detail));
+      list.appendChild(li);
+    });
+    $("panel-list").replaceChildren(list);
+    state.trigger = trigger;
+    state.open = { kind: kind, key: byPrincipal ? r.principal_id : r.scope };
+    save();
+    $("panel").inert = false;
+    $("panel").classList.add("open");
+    $("panel").scrollTop = 0;
+    $("close").focus();
+  }
+  function close() {
+    if ($("panel").inert) return;
+    $("panel").classList.remove("open");
+    $("panel").inert = true;
+    state.open = null;
+    save();
+    if (state.trigger && state.trigger.isConnected) state.trigger.focus();
+  }
+
+  // Events
+  let typing;
+  $("search").addEventListener("input", () => {
+    clearTimeout(typing);
+    typing = setTimeout(() => { state.q = $("search").value.trim().toLowerCase(); update(); }, 150);
+  });
+  document.querySelectorAll("[data-chip]").forEach((b) => b.addEventListener("click", () => {
+    const on = !state.chips.has(b.dataset.chip);
+    if (on) state.chips.add(b.dataset.chip); else state.chips.delete(b.dataset.chip);
+    b.setAttribute("aria-pressed", String(on));
+    update();
+  }));
+  $("clear").addEventListener("click", () => {
+    clearTimeout(typing);
+    state.q = ""; $("search").value = ""; state.chips.clear();
+    document.querySelectorAll("[data-chip]").forEach((b) => b.setAttribute("aria-pressed", "false"));
+    update();
+  });
+  $("more").addEventListener("click", () => { const from = state.limit; state.limit += PAGE; draw(from); });
+  $("rows").addEventListener("click", (e) => {
+    const tr = e.target.closest("tr");
+    if (!tr) return;
+    const scope = e.target.closest("[data-open=scope]");
+    open(scope ? "scope" : "principal", tr.record, scope || tr.querySelector("[data-open=principal]"));
+  });
+  $("close").addEventListener("click", close);
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
+  $("download").addEventListener("click", download);
+  $("copy").addEventListener("click", () => {
+    const select = () => getSelection().selectAllChildren($("panel-id"));
+    if (!navigator.clipboard) { select(); return; }
+    navigator.clipboard.writeText($("panel-id").textContent).then(() => { $("copy").textContent = "Copied"; }, select);
+  });
+  $("theme").addEventListener("click", () => {
+    root.dataset.theme = isDark() ? "light" : "dark";
+    try { localStorage.setItem("ara-theme", root.dataset.theme); } catch (e) { /* not kept across reloads */ }
+    themeLabel();
+  });
+  systemDark.addEventListener("change", themeLabel);
+  // Print every matching row, not only the rows shown so far.
+  window.addEventListener("beforeprint", () => { if (state.list.length > state.limit) { const from = state.limit; state.limit = state.list.length; draw(from); } });
+  window.addEventListener("hashchange", restore);
+
+  themeLabel();
+  restore();
+});
+</script>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div>
+      <h1>ARA</h1>
+      <p class="tenant" id="tenant"></p>
+      <p class="scope" id="scope"></p>
+    </div>
+    <div class="facts">
+      <p id="scanned"></p>
+      <p id="coverage"></p>
+      <p id="state"></p>
+    </div>
+    <button class="btn" id="theme" type="button">Dark theme</button>
+  </header>
+  <noscript><p>This report needs JavaScript to show the assignments.</p></noscript>
+  <div class="banner" id="banner" role="status" hidden></div>
+  <dl class="stats" id="stats"></dl>
+  <div class="bar">
+    <input class="search" id="search" type="search" name="q" autocomplete="off" placeholder="Search principal, ID, role, scope or type" aria-label="Search assignments">
+    <button class="btn" type="button" data-chip="hp" aria-pressed="false">High privilege</button>
+    <button class="btn" type="button" data-chip="el" aria-pressed="false">Eligible</button>
+    <button class="btn" type="button" data-chip="us" aria-pressed="false">Users only</button>
+    <button class="btn" id="download" type="button">Download CSV</button>
+  </div>
+  <p class="count" id="count" aria-live="polite"></p>
+  <div class="table-wrap" id="table">
+    <table>
+      <thead><tr><th scope="col">Principal</th><th scope="col">Role</th><th scope="col">Scope</th><th scope="col">Assignment</th><th scope="col">Ends</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+  <div class="empty" id="empty" hidden>
+    <p id="empty-text"></p>
+    <button class="btn" id="clear" type="button">Clear filters</button>
+  </div>
+  <button class="btn more" id="more" type="button" hidden>Show more</button>
+  <footer>
+    <p>Only direct assignments at or below the scanned scope are listed; assignments inherited from above it are not.</p>
+    <p id="about"></p>
+  </footer>
+</div>
+<aside class="panel" id="panel" aria-labelledby="panel-title" inert>
+  <div class="panel-head">
+    <h2 id="panel-title"></h2>
+    <button class="btn" id="close" type="button">Close</button>
+  </div>
+  <p class="sub" id="panel-upn" hidden></p>
+  <p class="sub" id="panel-sub"></p>
+  <div class="panel-ref">
+    <p class="panel-id"><span id="panel-id-label">Object ID: </span><span id="panel-id"></span></p>
+    <button class="btn" id="copy" type="button">Copy</button>
+  </div>
+  <ul id="panel-list"></ul>
+</aside>
+<script type="application/json" id="ara-data">/*ARA_DATA*/</script>
+</body>
+</html>
+"""
+
+
+class HTMLOutputHandler(OutputHandler):
+    extension = "html"
+
+    @staticmethod
+    def embed(data: Dict) -> str:
+        """JSON that cannot end its <script> element or break a JS string."""
+        text = json.dumps(data, ensure_ascii=False)
+        for ch in ("<", ">", "&", "\u2028", "\u2029"):
+            text = text.replace(ch, "\\u%04x" % ord(ch))
+        return text
+
+    def render(self, results: ScanResult) -> str:
+        data = results.to_dict()
+        data["report"] = {
+            "high_privilege_roles": list(ARAConfig.HIGH_PRIVILEGE_ROLES),
+            "descriptor": ARAConfig.DESCRIPTOR,
+            "slogan": ARAConfig.SLOGAN,
+            "filters_not_applied": results.filters_not_applied,  # not in metadata, but the banner needs it
+            "stopped": results.stopped or results.interrupted,
+            "scope_name": results.scope_name,
+        }
+        return REPORT_TEMPLATE.replace("/*ARA_DATA*/", self.embed(data))
+
+
+class ConsoleSummary:
+    """Prints the scan outcome: counts, roles, gaps and written files."""
+
+    def print(self, results: ScanResult, paths: List[str]) -> None:
+        t = results.tenant
+        if t:
+            print("Tenant: " + (f"{t['name']} ({t['domain']})" if t['name'] and t['domain'] else t['name'] or t['id']))
+        print(f"Found {len(results.assignments)} role assignments in "
+                   f"{results.management_groups_scanned} management groups and "
+                   f"{results.subscriptions_scanned} subscriptions.")
+        roles = Counter(a.role_name for a in results.assignments)
+        for role, count in sorted(roles.items(), key=lambda kv: (-kv[1], kv[0])):
+            print(f"  {count:>6}  {role}")
+        if results.pim_status != "included":
+            print(f"PIM: {results.pim_status}")
+        if results.names != "resolved":
+            print(f"Names: {results.names}")
+        for failed in results.failed_scopes:
+            print(f"Failed scope: {failed['scope']}: {failed['error']}")
+        if not results.complete:
+            print("Scan incomplete.")
+        for path in paths[1:] + paths[:1]:  # the report is written first and printed last
+            print(f"Written: {path}")
 
 
 # Main Application
 class ARAApplication:
-    """Main ARA application class."""
-    
-    def __init__(self, results_dir: str = ARAConfig.RESULTS_DIR):
-        """Initialize ARA application."""
-        self.results_dir = results_dir
-        self.output_handlers = {
-            'summary': SummaryOutputHandler(),
-            'json': JSONOutputHandler(results_dir),
-            'csv': CSVOutputHandler(results_dir),
-        }
-    
+    """Parses the scope, scans, resolves names, filters and writes the outputs."""
+
+    def __init__(self, scanner_factory: Optional[Callable] = None, graph_factory: Optional[Callable] = None):
+        self.auth = AzureAuthenticationManager()
+        self.token = None  # type: Optional[str]
+        self.scanner_factory = scanner_factory or self._scanner
+        self.graph_factory = graph_factory or (lambda: GraphAPIClient.create(
+            lambda: AzureCliAuthProvider().get_token("https://graph.microsoft.com")))
+        self.last_result = None  # type: Optional[ScanResult]
+
+    def _scanner(self, args: argparse.Namespace) -> Scanner:
+        api = AzureAPIClient(self.token, args.api_delay, refresh_token=self.auth.refresher())
+        return Scanner(HierarchyClient(api), AssignmentCollector(api),
+                       None if args.skip_pim else PIMCollector(api),
+                       show_progress=not (args.no_progress or args.debug))
+
+    def handlers(self, args: argparse.Namespace) -> List[OutputHandler]:
+        handlers = [HTMLOutputHandler(args.output_dir), JSONOutputHandler(args.output_dir)]  # type: List[OutputHandler]
+        if args.format == "csv":
+            handlers.append(CSVOutputHandler(args.output_dir))
+        return handlers
+
     def run(self, args: argparse.Namespace) -> int:
-        """Run the ARA application."""
+        """Run one scan and return the exit code."""
         try:
-            # Get authentication token
-            auth_manager = AzureAuthenticationManager(allow_interactive=True)
-            token = auth_manager.get_token(args.token)
-            
-            # Initialize API clients with rate limiting
-            api_client = AzureAPIClient(token, api_delay=args.api_delay)
-            if not api_client.test_authentication():
-                return ARAConfig.EXIT_CODE_ERROR
-            
-            # Initialize basic clients
-            mg_client = ManagementGroupClient(api_client)
-            ra_client = RoleAssignmentClient(api_client)
-            pim_client = PIMClient(api_client)  # PIM eligible and time-bound assignments
-            graph_client = GraphAPIClient()  # Gets its own Graph token
-            
-            # Normalize scope - support multiple formats for both MG and subscriptions
-            scope = args.scope
-            scope_type = None  # Will be 'ManagementGroup' or 'Subscription'
-            
-            if not scope.startswith('/'):
-                # Detect if it's a subscription GUID format (8-4-4-4-12 hex pattern)
-                import re
-                guid_pattern = r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-                
-                if re.match(guid_pattern, scope, re.IGNORECASE):
-                    # It's a subscription GUID
-                    scope = f"/subscriptions/{scope}"
-                    scope_type = 'Subscription'
-                elif scope.startswith('subscriptions/'):
-                    # Short format: subscriptions/{guid}
-                    scope = f"/{scope}"
-                    scope_type = 'Subscription'
-                elif '/' not in scope:
-                    # Just an ID - assume it's a management group
-                    scope = f"/providers/Microsoft.Management/managementGroups/{scope}"
-                    scope_type = 'ManagementGroup'
-                elif scope.startswith('managementGroups/'):
-                    # Short format: managementGroups/my-mg
-                    scope = f"/providers/Microsoft.Management/{scope}"
-                    scope_type = 'ManagementGroup'
-                else:
-                    raise ValidationError(
-                        f"Invalid scope format: {args.scope}\n"
-                        f"Supported formats:\n"
-                        f"  Management Group:\n"
-                        f"    - ID: my-mg\n"
-                        f"    - Short: managementGroups/my-mg\n"
-                        f"    - Full: /providers/Microsoft.Management/managementGroups/my-mg\n"
-                        f"  Subscription:\n"
-                        f"    - GUID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx\n"
-                        f"    - Short: subscriptions/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx\n"
-                        f"    - Full: /subscriptions/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-                    )
-            else:
-                # Full path provided - detect type
-                if '/subscriptions/' in scope:
-                    scope_type = 'Subscription'
-                elif '/managementGroups/' in scope:
-                    scope_type = 'ManagementGroup'
-                else:
-                    raise ValidationError(
-                        f"Scope must be a management group or subscription. Got: {args.scope}"
-                    )
-            
-            # Validate depth based on scope type
-            if scope_type == 'Subscription':
-                # For subscription scope, auto-adjust default depth
-                if args.depth == ARAConfig.DEFAULT_DEPTH:  # management-groups is default
-                    logger.info(f"ℹ️  Auto-adjusting depth from '{args.depth}' to 'resource-groups' for subscription scope")
-                    args.depth = ARAConfig.DEPTH_RESOURCE_GROUPS
-                elif args.depth == ARAConfig.DEPTH_MANAGEMENT_GROUPS:
-                    raise ValidationError(
-                        f"Invalid depth '{args.depth}' for subscription scope.\n"
-                        f"Subscription scopes cannot scan management groups.\n"
-                        f"Valid depths: resource-groups, resources"
-                    )
-                elif args.depth == ARAConfig.DEPTH_SUBSCRIPTIONS:
-                    raise ValidationError(
-                        f"Invalid depth '{args.depth}' for subscription scope.\n"
-                        f"The scope is already a subscription. Use 'resource-groups' or 'resources' to scan deeper,\n"
-                        f"or omit --depth to scan only the subscription itself."
-                    )
-            
-            # Initialize depth-dependent clients (after depth may have been auto-adjusted)
-            sub_client = SubscriptionClient(api_client)
-            rg_client = ResourceGroupClient(api_client) if args.depth in [ARAConfig.DEPTH_RESOURCE_GROUPS, ARAConfig.DEPTH_RESOURCES] else None
-            res_client = ResourceClient(api_client) if args.depth == ARAConfig.DEPTH_RESOURCES else None
-            
-            # Initialize assignment filter
+            ref = ScopeParser.parse(args.scope)
             assignment_filter = AssignmentFilter(args)
-            if assignment_filter.has_filters():
-                logger.info("📌 Active Filters:")
-                for key, value in assignment_filter.get_summary().items():
-                    logger.info(f"   {key}: {value}")
-                logger.info("")
-            
-            # Get scopes to scan based on scope type
-            if scope_type == 'ManagementGroup':
-                mg_id = mg_client.get_management_group_id_from_scope(scope)
-                logger.info(f"📂 Management Group ID: {mg_id}")
-                logger.info(f"🎯 Scan Depth: {args.depth}")
-                
-                # Get all scopes in hierarchy
-                logger.info("\n🔍 Discovering child management groups and subscriptions...")
-                all_scopes = mg_client.get_management_group_hierarchy(mg_id)
-                logger.info(f"✅ Found {len(all_scopes)} scope(s) to process\n")
-                
-                # Scan each scope for role assignments
-                results = ScanResult(
-                    organization=mg_id,
-                    scope=scope,
-                    filters_applied=assignment_filter.get_summary()
-                )
-            else:  # Subscription scope
-                subscription_id = scope.split('/')[-1]
-                
-                # Get subscription display name
-                subscription_name = sub_client.get_subscription_display_name(subscription_id)
-                
-                logger.info(f"📂 Subscription: {subscription_name}")
-                logger.info(f"   ID: {subscription_id}")
-                logger.info(f"🎯 Scan Depth: {args.depth}")
-                
-                # Create a single-scope list with just this subscription (with display name)
-                logger.info("\n🔍 Scanning subscription...")
-                subscription_scope = Scope(
-                    scope_path=scope,
-                    name=subscription_name,
-                    scope_type='Subscription',
-                    depth=0
-                )
-                all_scopes = [subscription_scope]
-                logger.info(f"✅ Ready to scan\n")
-                
-                # Scan the subscription
-                results = ScanResult(
-                    organization=subscription_name,
-                    scope=scope,
-                    filters_applied=assignment_filter.get_summary()
-                )
-            
-            resource_count = 0
-            
-            # Initialize progress tracker
-            # Disable progress if debug mode is on or if explicitly disabled
-            show_progress = not (args.debug or args.no_progress)
-            
-            with ProgressTracker(total=len(all_scopes), desc="Scanning scopes", disable=not show_progress) as progress:
-                for scope in all_scopes:
-                    # If depth is management-groups only, skip subscriptions entirely
-                    if args.depth == ARAConfig.DEPTH_MANAGEMENT_GROUPS and scope.scope_type == 'Subscription':
-                        progress.update(1)
-                        continue
-                    
-                    results.add_scanned_scope(scope)
-                    indent = "  " * scope.depth
-                    logger.info(f"{indent}🔍 Scanning: {scope.name} ({scope.scope_type})")
-                    
-                    # Get direct assignments for current scope
-                    self._scan_scope_assignments(scope, results, ra_client, pim_client, graph_client, indent, assignment_filter, args)
-                    
-                    # If this is a subscription and we want deeper scanning
-                    if scope.scope_type == 'Subscription' and args.depth in [ARAConfig.DEPTH_RESOURCE_GROUPS, ARAConfig.DEPTH_RESOURCES]:
-                        subscription_id = scope.scope_path.split('/')[-1]
-                        
-                        # Get resource groups
-                        logger.info(f"{indent}  📦 Listing resource groups...")
-                        resource_groups = rg_client.list_resource_groups(subscription_id)
-                        logger.info(f"{indent}  ✅ Found {len(resource_groups)} resource group(s)")
-                        
-                        for rg in resource_groups:
-                            if resource_count >= args.max_resources:
-                                logger.warning(f"{indent}    ⚠️  Reached max resource limit ({args.max_resources}). Stopping resource scan.")
-                                break
-                            
-                            results.add_scanned_scope(rg)
-                            rg_indent = indent + "    "
-                            logger.info(f"{rg_indent}🔍 Scanning: {rg.name} (Resource Group)")
-                            
-                            # Scan resource group assignments
-                            self._scan_scope_assignments(rg, results, ra_client, pim_client, graph_client, rg_indent, assignment_filter, args)
-                            
-                            # If we want individual resources
-                            if args.depth == ARAConfig.DEPTH_RESOURCES:
-                                rg_name = rg.name
-                                logger.info(f"{rg_indent}  📦 Listing resources...")
-                                resources = res_client.list_resources(subscription_id, rg_name, args.resource_types)
-                                logger.info(f"{rg_indent}  ✅ Found {len(resources)} resource(s)")
-                                
-                                for resource in resources:
-                                    if resource_count >= args.max_resources:
-                                        logger.warning(f"{rg_indent}    ⚠️  Reached max resource limit ({args.max_resources}). Stopping.")
-                                        break
-                                    
-                                    results.add_scanned_scope(resource)
-                                    res_indent = rg_indent + "      "
-                                    logger.info(f"{res_indent}🔍 {resource.name} ({resource.resource_type})")
-                                    
-                                    # Scan individual resource assignments
-                                    self._scan_scope_assignments(resource, results, ra_client, pim_client, graph_client, res_indent, assignment_filter, args)
-                                    resource_count += 1
-                    
-                    # Update progress after processing each scope
-                    progress.update(1)
-            
-            logger.info(f"\n✅ Scan complete: {results.total_assignments_found} assignments "
-                       f"across {results.total_scopes_scanned} scopes")
-            
-            # Generate outputs
-            if args.format == 'json':
-                self.output_handlers['json'].generate(results)
-            elif args.format == 'csv':
-                self.output_handlers['csv'].generate(results)
-            
-            # Always show summary
-            self.output_handlers['summary'].generate(results)
-            
-            logger.info("🎉 ARA completed successfully!")
-            return ARAConfig.EXIT_CODE_SUCCESS
-            
-        except KeyboardInterrupt:
-            logger.info("\n❌ Operation cancelled by user")
-            return ARAConfig.EXIT_CODE_INTERRUPT
-        except (AuthenticationError, ValidationError, APIError, ExportError) as e:
-            logger.error(f"❌ Error: {e}")
+            if args.resource_types and args.depth != ARAConfig.DEPTH_RESOURCES:
+                raise ValidationError("--resource-types needs --depth resources")
+        except ValidationError as e:
+            logger.error(str(e))
+            return ARAConfig.EXIT_CODE_USAGE
+
+        try:
+            self.token = self.auth.get_token(args.token)
+        except AuthenticationError as e:
+            logger.error(str(e))
             return ARAConfig.EXIT_CODE_ERROR
-        except Exception as e:
-            logger.error(f"❌ Unexpected error: {e}")
-            if args.debug:
-                import traceback
-                traceback.print_exc()
+        graph = self.graph_factory()
+        if assignment_filter.needs_graph() and graph is None:
+            logger.error("--principal-name-filter and --exclude-managed-identities need a Microsoft Graph token. "
+                         "Run az login or set AZURE_GRAPH_TOKEN.")
             return ARAConfig.EXIT_CODE_ERROR
-    
-    def _scan_scope_assignments(self, scope: Scope, results: ScanResult, 
-                                ra_client: RoleAssignmentClient,
-                                pim_client: PIMClient,
-                                graph_client: GraphAPIClient, 
-                                indent: str,
-                                assignment_filter: Optional['AssignmentFilter'] = None,
-                                args=None) -> None:
-        """Scan role assignments (both active and eligible via PIM) for a specific scope.
-        
-        Args:
-            scope: Scope to scan
-            results: Results object to add assignments to
-            ra_client: Role assignment client (standard RBAC)
-            pim_client: PIM client (eligible and time-bound assignments)
-            graph_client: Graph API client
-            indent: Logging indentation
-            assignment_filter: Optional filter to apply to assignments
-            args: Command-line arguments (for --skip-pim flag)
-        """
-        all_assignments = []
-        active_permanent_count = 0
-        active_timebound_count = 0
-        eligible_permanent_count = 0
-        eligible_timebound_count = 0
-        
-        # Determine if we should skip PIM for this scope
-        skip_pim = getattr(args, 'skip_pim', False) if args else False
-        
-        # PIM APIs only work for management groups, subscriptions, and resource groups (not individual resources)
-        pim_supported_scope = scope.scope_type in ('Management Group', 'Subscription', 'Resource Group')
-        
-        # Track assignments by unique key (principal_id + role_id + scope) to avoid duplicates
-        seen_assignments = set()
-        
-        if not skip_pim and pim_supported_scope:
-            # Try to fetch PIM data (eligible and time-bound active assignments)
-            
-            # Fetch eligible assignments (PIM)
+        if assignment_filter.needs_graph():
             try:
-                eligible_data = pim_client.get_eligible_assignments_for_scope(scope)
-                
-                for eligibility_data in eligible_data:
-                    props = eligibility_data.get('properties', {})
-                    principal_id = props.get('principalId', '')
-                    principal_type = props.get('principalType', 'Unknown')
-                    role_def_id = props.get('roleDefinitionId', '')
-                    start_date = props.get('startDateTime')
-                    end_date = props.get('endDateTime')
-                    
-                    # Create unique key for deduplication
-                    assignment_key = (principal_id, role_def_id, scope.scope_path.lower())
-                    if assignment_key in seen_assignments:
-                        continue
-                    seen_assignments.add(assignment_key)
-                    
-                    # Determine if eligible assignment is permanent or time-bound
-                    assignment_type = "Eligible time-bound" if end_date else "Eligible permanent"
-                    
-                    # Get role name
-                    role_name = ra_client.get_role_definition(role_def_id)
-                    
-                    # Get principal name
-                    try:
-                        principal_name = graph_client.get_principal_display_name(principal_id, principal_type)
-                    except Exception:
-                        principal_name = principal_id
-                    
-                    # Create role assignment
-                    role_assignment = RoleAssignment(
-                        principal_id=principal_id,
-                        principal_name=principal_name,
-                        principal_type=principal_type,
-                        role_name=role_name,
-                        role_id=role_def_id,
-                        scope=scope.scope_path,
-                        scope_name=scope.name,
-                        scope_type=scope.scope_type,
-                        resource_type=scope.resource_type,
-                        assignment_type=assignment_type,
-                        start_date_time=start_date,
-                        end_date_time=end_date
-                    )
-                    all_assignments.append(role_assignment)
-                    
-                    if assignment_type == "Eligible permanent":
-                        eligible_permanent_count += 1
-                    else:
-                        eligible_timebound_count += 1
-                        
-            except Exception as e:
-                logger.warning(f"⚠️  Could not fetch PIM eligible assignments for {scope.name}: {e}")
-                logger.debug(f"PIM eligible assignments API error details: {e}", exc_info=True)
-            
-            # Fetch time-bound active assignments (PIM activated)
-            try:
-                timebound_data = pim_client.get_time_bound_active_assignments_for_scope(scope)
-                
-                for timebound_assignment in timebound_data:
-                    props = timebound_assignment.get('properties', {})
-                    principal_id = props.get('principalId', '')
-                    principal_type = props.get('principalType', 'Unknown')
-                    role_def_id = props.get('roleDefinitionId', '')
-                    start_date = props.get('startDateTime')
-                    end_date = props.get('endDateTime')
-                    
-                    # Create unique key for deduplication
-                    assignment_key = (principal_id, role_def_id, scope.scope_path.lower())
-                    if assignment_key in seen_assignments:
-                        logger.debug(f"Skipping duplicate time-bound active assignment: {principal_id} / {role_def_id}")
-                        continue
-                    seen_assignments.add(assignment_key)
-                    
-                    # Get role name
-                    role_name = ra_client.get_role_definition(role_def_id)
-                    
-                    # Get principal name
-                    try:
-                        principal_name = graph_client.get_principal_display_name(principal_id, principal_type)
-                    except Exception:
-                        principal_name = principal_id
-                    
-                    # Determine if active assignment is permanent or time-bound
-                    # Per Microsoft docs: check endDateTime to distinguish permanent vs time-bound
-                    # Service principals with no endDateTime are "Active permanent" (not eligible-based)
-                    assignment_type = "Active time-bound" if end_date else "Active permanent"
-                    
-                    # Create role assignment
-                    role_assignment = RoleAssignment(
-                        principal_id=principal_id,
-                        principal_name=principal_name,
-                        principal_type=principal_type,
-                        role_name=role_name,
-                        role_id=role_def_id,
-                        scope=scope.scope_path,
-                        scope_name=scope.name,
-                        scope_type=scope.scope_type,
-                        resource_type=scope.resource_type,
-                        assignment_type=assignment_type,
-                        start_date_time=start_date,
-                        end_date_time=end_date
-                    )
-                    all_assignments.append(role_assignment)
-                    
-                    if assignment_type == "Active permanent":
-                        active_permanent_count += 1
-                    else:
-                        active_timebound_count += 1
-                    
-            except Exception as e:
-                logger.warning(f"⚠️  Could not fetch PIM time-bound active assignments for {scope.name}: {e}")
-                logger.debug(f"PIM time-bound active assignments API error details: {e}", exc_info=True)
-        
-        # Fetch standard permanent active role assignments
-        assignments_data = ra_client.get_direct_assignments_for_scope(scope)
-        
-        for assignment_data in assignments_data:
-            props = assignment_data.get('properties', {})
-            principal_id = props.get('principalId', '')
-            principal_type = props.get('principalType', 'Unknown')
-            role_def_id = props.get('roleDefinitionId', '')
-            
-            # Create unique key for deduplication (avoid counting PIM-activated assignments twice)
-            assignment_key = (principal_id, role_def_id, scope.scope_path.lower())
-            if assignment_key in seen_assignments:
-                logger.debug(f"Skipping duplicate standard assignment: {principal_id} / {role_def_id}")
-                continue
-            seen_assignments.add(assignment_key)
-            
-            # Get role name
-            role_name = ra_client.get_role_definition(role_def_id)
-            
-            # Get principal name
-            try:
-                principal_name = graph_client.get_principal_display_name(principal_id, principal_type)
-            except Exception:
-                principal_name = principal_id
-            
-            # Create role assignment (Active permanent - standard RBAC)
-            role_assignment = RoleAssignment(
-                principal_id=principal_id,
-                principal_name=principal_name,
-                principal_type=principal_type,
-                role_name=role_name,
-                role_id=role_def_id,
-                scope=scope.scope_path,
-                scope_name=scope.name,
-                scope_type=scope.scope_type,
-                resource_type=scope.resource_type,
-                assignment_type="Active permanent"
-            )
-            all_assignments.append(role_assignment)
-            active_permanent_count += 1
-        
-        # Log findings
-        if all_assignments:
-            # Apply filters if configured
-            if assignment_filter and assignment_filter.has_filters():
-                filtered_assignments = assignment_filter.apply(all_assignments)
-                logger.info(f"{indent}  📋 Found {len(all_assignments)} assignment(s): "
-                           f"{active_permanent_count} active permanent, {active_timebound_count} active time-bound, "
-                           f"{eligible_permanent_count} eligible permanent, {eligible_timebound_count} eligible time-bound "
-                           f"({len(filtered_assignments)} after filtering)")
-            else:
-                filtered_assignments = all_assignments
-                logger.info(f"{indent}  📋 Found {len(filtered_assignments)} assignment(s): "
-                           f"{active_permanent_count} active permanent, {active_timebound_count} active time-bound, "
-                           f"{eligible_permanent_count} eligible permanent, {eligible_timebound_count} eligible time-bound")
-            
-            # Add filtered assignments to results
-            for assignment in filtered_assignments:
-                results.add_assignment(assignment)
+                graph.get_by_ids(["00000000-0000-0000-0000-000000000000"])
+            except ARAError as e:
+                logger.error(f"Microsoft Graph lookup failed: {e}. --principal-name-filter and "
+                             "--exclude-managed-identities need a working Microsoft Graph token.")
+                return ARAConfig.EXIT_CODE_ERROR
+
+        scanner = self.scanner_factory(args)
+        try:
+            ref = scanner.resolve(ref)
+            results = scanner.scan(ref, ScopeParser.resolve_depth(ref.kind, args.depth), args.resource_types)
+        except ValidationError as e:
+            logger.error(str(e))
+            return ARAConfig.EXIT_CODE_USAGE
+        except (APIError, AuthenticationError) as e:
+            logger.error(f"Cannot read {ref.path}: {e}")
+            return ARAConfig.EXIT_CODE_ERROR
+
+        resolver = PrincipalResolver(graph)
+        assignments, results.names = resolver.resolve(results.assignments)
+        if assignment_filter.needs_graph() and (results.names != "resolved" or not resolver.asked_graph):
+            logger.warning("Principal names are incomplete. Filters were not applied.")
+            results.assignments = assignments
+            results.filters_not_applied = True
         else:
-            logger.info(f"{indent}  ⚪ No assignments")
+            results.assignments_before_filters = len(assignments)
+            results.assignments = assignment_filter.apply(assignments)
+            results.filters_applied = assignment_filter.get_summary()
+        if args.resource_types:
+            results.filters_applied['resource_types'] = ', '.join(args.resource_types)
+        self.last_result = results
+
+        try:
+            paths = [handler.generate(results) for handler in self.handlers(args)]
+        except ExportError as e:
+            logger.error(str(e))
+            return ARAConfig.EXIT_CODE_ERROR
+        ConsoleSummary().print(results, paths)
+        if results.interrupted:
+            return ARAConfig.EXIT_CODE_INTERRUPT
+        return ARAConfig.EXIT_CODE_SUCCESS if results.complete else ARAConfig.EXIT_CODE_INCOMPLETE
 
 
-
-def parse_arguments() -> argparse.Namespace:
+def parse_arguments(argv: Optional[List[str]] = None) -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description=f"Azure Role Assignment Exporter (ARA) v{__version__} - Export Azure role assignments",
+        description=f"ARA, {ARAConfig.DESCRIPTOR}. {ARAConfig.SLOGAN}\n"
+                    f"Exports the role assignments under a management group or subscription. Version {__version__}.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Authentication Methods (tried in order):
+Authentication (tried in order):
   1. --token argument
   2. Environment variables (AZURE_ACCESS_TOKEN, AZURE_TOKEN, ARM_ACCESS_TOKEN)
   3. Azure CLI (az account get-access-token)
-  4. macOS Keychain
-  5. Interactive prompt
+  4. Interactive prompt (only in a terminal)
+  Principal names come from Microsoft Graph: AZURE_GRAPH_TOKEN, else Azure CLI.
 
 Output:
-  Files are generated in the 'results/' directory.
-  Console output shows a summary of findings.
+  An HTML report and a JSON file are always written to --output-dir (default: results).
+  An incomplete scan writes *.partial.* files.
+
+Exit codes:
+  0 complete, 1 error and nothing written, 2 usage error,
+  3 incomplete with files written, 130 interrupted with partial files written.
 
 Examples:
-  # Scan management group (simple format)
   ara --scope my-mg
-
-  # Scan management group (full format)
-  ara --scope /providers/Microsoft.Management/managementGroups/my-mg
-
-  # Scan subscription (GUID format)
-  ara --scope xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-
-  # Scan subscription (full format)
-  ara --scope /subscriptions/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-
-  # Include subscriptions (for MG scope)
-  ara --scope my-mg --depth subscriptions
-
-  # Scan resource groups in a subscription
-  ara --scope xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx --depth resource-groups
-
-  # Export to CSV
-  ara --scope my-mg --format csv
-
-  # Use specific token
-  ara --scope my-mg --token YOUR_TOKEN
-
-  # Debug mode
-  ara --scope my-mg --debug
+  ara --scope /providers/Microsoft.Management/managementGroups/my-mg --depth subscriptions
+  ara --scope xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx --depth resources
+  ara --scope my-mg --format csv --role-filter "Owner,User Access Administrator"
         """
     )
     
     parser.add_argument(
         '--scope',
         required=True,
-        help='Scope to scan. Management Group: "my-mg" or full path. Subscription: GUID or "/subscriptions/{guid}"'
+        help='Scope to scan. Management group: "my-mg" or full path. Subscription: GUID or "/subscriptions/{guid}"'
     )
     
     parser.add_argument(
         '--token',
         help='Azure access token (overrides auto-detection)'
-    )
-    
-    parser.add_argument(
-        '--format',
-        choices=['json', 'csv'],
-        default='json',
-        help='Output format: json or csv'
     )
     
     parser.add_argument(
@@ -2001,24 +1882,16 @@ Examples:
             ARAConfig.DEPTH_RESOURCE_GROUPS,
             ARAConfig.DEPTH_RESOURCES
         ],
-        default=ARAConfig.DEFAULT_DEPTH,
-        help=f'Scan depth level (default: {ARAConfig.DEFAULT_DEPTH}). '
-             'WARNING: resource-groups and resources can be slow for large environments'
+        default=None,
+        help=f'Lowest scope level to include (default: {ARAConfig.DEPTH_MANAGEMENT_GROUPS} for a management group, '
+             f'{ARAConfig.DEPTH_RESOURCE_GROUPS} for a subscription)'
     )
     
     parser.add_argument(
         '--resource-types',
         nargs='+',
-        help='Filter resources by type (e.g., Microsoft.Compute/virtualMachines). '
-             'Only applies when --depth is "resources"'
-    )
-    
-    parser.add_argument(
-        '--max-resources',
-        type=int,
-        default=ARAConfig.DEFAULT_MAX_RESOURCES,
-        help=f'Maximum number of resources to scan (default: {ARAConfig.DEFAULT_MAX_RESOURCES}). '
-             'Safety limit to prevent runaway scans'
+        help='Keep only resources of these types (e.g. Microsoft.Compute/virtualMachines). '
+             'Needs --depth resources'
     )
     
     parser.add_argument(
@@ -2027,6 +1900,26 @@ Examples:
         default=ARAConfig.DEFAULT_API_DELAY,
         help=f'Delay between API calls in seconds (default: {ARAConfig.DEFAULT_API_DELAY}). '
              'Increase to avoid rate limiting'
+    )
+    
+    parser.add_argument(
+        '--format',
+        choices=['csv'],
+        default=None,
+        help='Also write a CSV file next to the HTML and JSON files'
+    )
+    
+    parser.add_argument(
+        '--output-dir',
+        default=ARAConfig.RESULTS_DIR,
+        help=f'Directory for the output files (default: {ARAConfig.RESULTS_DIR})'
+    )
+    
+    parser.add_argument(
+        '--skip-pim',
+        action='store_true',
+        help='Skip PIM (Privileged Identity Management) API calls. '
+             'All assignments then get the type "Active"'
     )
     
     parser.add_argument(
@@ -2040,42 +1933,29 @@ Examples:
         '--principal-type-filter',
         type=str,
         help='Filter by principal type (comma-separated for multiple). '
-             'Valid types: User, Group, ServicePrincipal. '
+             f'Valid types: {", ".join(ARAConfig.PRINCIPAL_TYPES)}. '
              'Example: --principal-type-filter "User,Group"'
     )
     
     parser.add_argument(
         '--principal-name-filter',
         type=str,
-        help='Filter by principal name (supports regex patterns). '
-             'Example: --principal-name-filter "^Admin.*"'
-    )
-    
-    parser.add_argument(
-        '--exclude-system',
-        action='store_true',
-        help='Exclude system-assigned managed identities from results'
+        help='Filter by principal name (regex, case-insensitive). Needs a Microsoft Graph token. '
+             'Example: --principal-name-filter "^Admin"'
     )
     
     parser.add_argument(
         '--assignment-type-filter',
         type=str,
         help='Filter by assignment type (comma-separated for multiple). '
-             'Valid types: "Active permanent", "Active time-bound", "Eligible permanent", "Eligible time-bound". '
+             f'Valid types: {", ".join(ARAConfig.ASSIGNMENT_TYPES)}. '
              'Example: --assignment-type-filter "Active permanent,Eligible permanent"'
     )
     
     parser.add_argument(
-        '--skip-pim',
+        '--exclude-managed-identities',
         action='store_true',
-        help='Skip PIM (Privileged Identity Management) API calls. '
-             'Use this if PIM is not enabled or to improve performance.'
-    )
-    
-    parser.add_argument(
-        '--debug',
-        action='store_true',
-        help='Enable debug output'
+        help='Leave out managed identities. Needs a Microsoft Graph token'
     )
     
     parser.add_argument(
@@ -2085,41 +1965,30 @@ Examples:
     )
     
     parser.add_argument(
-        '--version',
-        action='version',
-        version=f'ARA v{__version__}'
+        '--debug',
+        action='store_true',
+        help='Enable debug output'
     )
     
-    return parser.parse_args()
+    parser.add_argument(
+        '--version',
+        action='version',
+        version=f'ARA {__version__}'
+    )
+    
+    return parser.parse_args(argv)
 
 
 def main() -> int:
     """Main application entry point."""
-    # Ignore SIGPIPE to prevent broken pipe errors
-    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
-    
     args = parse_arguments()
-    
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
-    
-    # Create results directory relative to script location
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    results_dir = os.path.join(script_dir, ARAConfig.RESULTS_DIR)
-    
-    app = ARAApplication(results_dir)
     try:
-        return app.run(args)
-    except BrokenPipeError:
-        try:
-            sys.stdout.close()
-        except OSError:
-            pass
-        try:
-            sys.stderr.close()
-        except OSError:
-            pass
-        return ARAConfig.EXIT_CODE_SUCCESS
+        return ARAApplication().run(args)
+    except KeyboardInterrupt:
+        logger.info("Cancelled.")
+        return ARAConfig.EXIT_CODE_INTERRUPT
 
 
 if __name__ == "__main__":
