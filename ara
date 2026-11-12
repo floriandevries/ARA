@@ -50,7 +50,7 @@ import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Any, Callable, Dict, List, Optional
 
 __version__ = "2.1.0"
 __author__ = "fjdev"
@@ -119,8 +119,8 @@ class ARAConfig:
     # Resource scanning limits
     DEFAULT_MAX_RESOURCES = 10000
     DEFAULT_API_DELAY = 0.1  # seconds between API calls
-    RATE_LIMIT_RETRY_DELAY = 60  # seconds to wait on 429
-    MAX_RETRY_ATTEMPTS = 3
+    MAX_ATTEMPTS = 4
+    RETRY_WAITS = (2, 4, 8)  # seconds before retry 1, 2, 3 unless Retry-After says otherwise
     
     # Resource API version
     RESOURCE_API_VERSION = "2021-04-01"
@@ -163,8 +163,10 @@ class AuthenticationError(ARAError):
 
 
 class APIError(ARAError):
-    """Raised when API operations fail."""
-    pass
+    """Raised when API operations fail. `status` is the HTTP status, if any."""
+    def __init__(self, message: str, status: Optional[int] = None):
+        super().__init__(message)
+        self.status = status
 
 
 class ExportError(ARAError):
@@ -749,112 +751,91 @@ class AzureAuthenticationManager:
 
 
 # API Clients
-class AzureAPIClient:
-    """Azure API client with caching, rate limiting, and error handling."""
-    
-    def __init__(self, token: str, api_delay: float = ARAConfig.DEFAULT_API_DELAY):
-        """Initialize API client."""
+class HttpClient:
+    """JSON over HTTPS with a bearer token, retries, pagination and one token refresh on 401."""
+
+    def __init__(self, token: str, api_delay: float = ARAConfig.DEFAULT_API_DELAY,
+                 refresh_token: Optional[Callable[[], Optional[str]]] = None,
+                 opener: Callable = urllib.request.urlopen, sleep: Callable[[float], None] = time.sleep):
         if not token:
             raise ValueError("Token cannot be empty")
-        
         self.token = token
         self.api_delay = api_delay
-        self.headers = {
-            'Authorization': f'Bearer {token}',
-            'Content-Type': 'application/json',
-            'User-Agent': f'AzureRoleAssignmentExporter/{__version__}'
-        }
-        self._auth_verified = False
+        self.refresh_token = refresh_token
+        self.opener = opener
+        self.sleep = sleep
         self._last_request_time = 0.0
-    
-    @functools.lru_cache(maxsize=ARAConfig.CACHE_SIZE_LIMIT)
-    def _make_cached_request(self, url: str, params_tuple: tuple = ()) -> Dict:
-        """Make a cached request to reduce duplicate API calls."""
-        params = dict(params_tuple) if params_tuple else None
-        return self._make_request_internal(url, params)
-    
-    def _make_request(self, url: str, params: Optional[Dict] = None) -> Dict:
-        """Public interface for making requests."""
-        if params:
-            params_tuple = tuple(sorted(params.items()))
-            return self._make_cached_request(url, params_tuple)
-        else:
-            return self._make_cached_request(url)
-    
+
     def _apply_rate_limit(self) -> None:
         """Apply rate limiting between API calls."""
         if self.api_delay > 0:
-            current_time = time.time()
-            time_since_last = current_time - self._last_request_time
+            time_since_last = time.time() - self._last_request_time
             if time_since_last < self.api_delay:
-                time.sleep(self.api_delay - time_since_last)
+                self.sleep(self.api_delay - time_since_last)
             self._last_request_time = time.time()
-    
-    def _make_request_internal(self, url: str, params: Optional[Dict] = None) -> Dict:
-        """Make a request to the Azure API with error handling and retry logic."""
+
+    def request(self, method: str, url: str, params: Optional[Dict] = None, body: Optional[Dict] = None) -> Dict:
+        """Send one request; retry 429, 5xx and network errors; refresh the token once on 401."""
         if params:
-            url += "?" + urllib.parse.urlencode(params)
-        
-        request = urllib.request.Request(url, headers=self.headers)
-        
-        # Retry loop for rate limiting
-        for attempt in range(ARAConfig.MAX_RETRY_ATTEMPTS):
+            url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
+        data = json.dumps(body).encode() if body is not None else None
+        refreshed = False
+        for attempt in range(ARAConfig.MAX_ATTEMPTS):
+            self._apply_rate_limit()
+            request = urllib.request.Request(url, data=data, method=method, headers={
+                'Authorization': f'Bearer {self.token}',
+                'Content-Type': 'application/json',
+                'User-Agent': 'ARA/3.0.0',
+            })
+            retry_after = None
             try:
-                self._apply_rate_limit()
-                
-                with urllib.request.urlopen(request, timeout=ARAConfig.API_REQUEST_TIMEOUT) as response:
-                    return json.loads(response.read().decode())
-                    
+                with self.opener(request, timeout=ARAConfig.API_REQUEST_TIMEOUT) as response:
+                    return json.loads(response.read().decode() or "{}")
             except urllib.error.HTTPError as e:
-                if e.code == ARAConfig.HTTP_RATE_LIMITED and attempt < ARAConfig.MAX_RETRY_ATTEMPTS - 1:
-                    wait_time = ARAConfig.RATE_LIMIT_RETRY_DELAY * (2 ** attempt)  # Exponential backoff
-                    logger.warning(f"Rate limited (429). Waiting {wait_time}s before retry (attempt {attempt + 1}/{ARAConfig.MAX_RETRY_ATTEMPTS})")
-                    time.sleep(wait_time)
+                if e.code == ARAConfig.HTTP_UNAUTHORIZED:
+                    new_token = self.refresh_token() if self.refresh_token and not refreshed else None
+                    if not new_token:
+                        raise AuthenticationError(f"Token rejected (HTTP 401) for {url}")
+                    self.token, refreshed = new_token, True
                     continue
-                else:
-                    self._handle_http_error(e, url)
-            except urllib.error.URLError as e:
-                raise APIError(f"Network error: {e}")
+                try:
+                    detail = e.read().decode(errors="replace")
+                except Exception:
+                    detail = ""
+                error = APIError(f"HTTP {e.code} for {url}: {detail}", e.code)
+                if e.code != ARAConfig.HTTP_RATE_LIMITED and e.code < ARAConfig.HTTP_SERVER_ERROR:
+                    raise error
+                retry_after = (e.headers or {}).get("Retry-After")
             except json.JSONDecodeError as e:
-                raise APIError(f"Invalid JSON response: {e}")
-        
-        raise APIError("Max retry attempts exceeded")
-    
-    def _handle_http_error(self, error: urllib.error.HTTPError, url: str) -> None:
-        """Handle HTTP errors consistently."""
-        try:
-            error_body = error.read().decode() if error.fp else ""
-        except Exception:
-            error_body = "Unable to read error response"
-        
-        error_messages = {
-            ARAConfig.HTTP_UNAUTHORIZED: "Authentication failed - check credentials",
-            ARAConfig.HTTP_FORBIDDEN: "Access forbidden - insufficient permissions",
-            ARAConfig.HTTP_NOT_FOUND: "Resource not found",
-            ARAConfig.HTTP_RATE_LIMITED: "Rate limit exceeded - please wait",
-            ARAConfig.HTTP_SERVER_ERROR: "Azure API server error",
-        }
-        
-        message = error_messages.get(error.code, f"HTTP {error.code}")
-        raise APIError(f"{message}: {error_body}")
-    
-    def test_authentication(self) -> bool:
-        """Test if the token works."""
-        if self._auth_verified:
-            return True
-        
-        try:
-            url = f"{ARAConfig.AZURE_MANAGEMENT_URL}/subscriptions?api-version={ARAConfig.AZURE_API_VERSION}"
-            data = self._make_request(url)
-            
-            subscription_count = len(data.get('value', []))
-            logger.info(f"✅ Authenticated - found {subscription_count} subscriptions")
-            self._auth_verified = True
-            return True
-            
-        except APIError as e:
-            logger.error(f"❌ Authentication test failed: {e}")
-            return False
+                raise APIError(f"Invalid JSON response from {url}: {e}")
+            except OSError as e:  # URLError, socket.timeout, connection resets
+                error = APIError(f"Network error for {url}: {e}")
+            if attempt == ARAConfig.MAX_ATTEMPTS - 1:
+                raise error
+            wait = int(retry_after) if retry_after and retry_after.strip().isdigit() else ARAConfig.RETRY_WAITS[attempt]
+            logger.warning(f"{error}. Retrying in {wait}s (attempt {attempt + 1}/{ARAConfig.MAX_ATTEMPTS})")
+            self.sleep(wait)
+        raise APIError(f"No response after {ARAConfig.MAX_ATTEMPTS} attempts for {url}")  # 401 refresh used the last attempt
+
+    def get(self, url: str, params: Optional[Dict] = None) -> Dict:
+        return self.request("GET", url, params)
+
+    def get_all(self, url: str, params: Optional[Dict] = None) -> List[Dict]:
+        """Concatenate `value` over all pages, following `nextLink` as given."""
+        items = []  # type: List[Dict]
+        while url:
+            page = self.get(url, params)
+            items.extend(page.get("value", []))
+            url, params = page.get("nextLink"), None
+        return items
+
+
+class AzureAPIClient(HttpClient):
+    """HttpClient for Azure Resource Manager."""
+    BASE = ARAConfig.AZURE_MANAGEMENT_URL
+
+    def url(self, path: str) -> str:
+        return self.BASE + path
 
 
 class ManagementGroupClient:
@@ -922,7 +903,7 @@ class ManagementGroupClient:
         url = (f"{ARAConfig.AZURE_MANAGEMENT_URL}/providers/Microsoft.Management/"
                f"managementGroups/{mg_id}?api-version={ARAConfig.MGMT_GROUP_API_VERSION}"
                f"&$expand=children&$recurse=false")
-        return self.api_client._make_request(url)
+        return self.api_client.get(url)
 
 
 class SubscriptionClient:
@@ -937,7 +918,7 @@ class SubscriptionClient:
         url = (f"{ARAConfig.AZURE_MANAGEMENT_URL}/subscriptions/{subscription_id}"
                f"?api-version=2020-01-01")
         try:
-            return self.api_client._make_request(url)
+            return self.api_client.get(url)
         except Exception as e:
             logger.warning(f"Could not retrieve subscription details for {subscription_id}: {e}")
             return {}
@@ -965,7 +946,7 @@ class RoleAssignmentClient:
                    f"providers/Microsoft.Authorization/roleAssignments"
                    f"?api-version={ARAConfig.AUTH_API_VERSION}")
             
-            data = self.api_client._make_request(url)
+            data = self.api_client.get(url)
             
             for assignment in data.get('value', []):
                 # Only include assignments directly assigned to this scope
@@ -987,7 +968,7 @@ class RoleAssignmentClient:
         
         try:
             url = f"{ARAConfig.AZURE_MANAGEMENT_URL}{role_def_id}?api-version={ARAConfig.AUTH_API_VERSION}"
-            data = self.api_client._make_request(url)
+            data = self.api_client.get(url)
             role_name = data.get('properties', {}).get('roleName', 'Unknown')
             self._role_definition_cache[role_def_id] = role_name
             return role_name
@@ -1021,7 +1002,7 @@ class PIMClient:
                    f"providers/Microsoft.Authorization/roleEligibilityScheduleInstances"
                    f"?api-version=2020-10-01")
             
-            data = self.api_client._make_request(url)
+            data = self.api_client.get(url)
             
             for eligibility in data.get('value', []):
                 # Extract the scope from the eligibility
@@ -1071,7 +1052,7 @@ class PIMClient:
                    f"providers/Microsoft.Authorization/roleAssignmentScheduleInstances"
                    f"?api-version=2020-10-01")
             
-            data = self.api_client._make_request(url)
+            data = self.api_client.get(url)
             
             for assignment in data.get('value', []):
                 # Extract the scope from the assignment
@@ -1118,7 +1099,7 @@ class ResourceGroupClient:
             url = (f"{ARAConfig.AZURE_MANAGEMENT_URL}/subscriptions/{subscription_id}/"
                    f"resourcegroups?api-version={ARAConfig.RESOURCE_API_VERSION}")
             
-            data = self.api_client._make_request(url)
+            data = self.api_client.get(url)
             
             for rg in data.get('value', []):
                 rg_name = rg.get('name', 'Unknown')
@@ -1164,7 +1145,7 @@ class ResourceClient:
                    f"resourceGroups/{resource_group_name}/resources"
                    f"?api-version={ARAConfig.RESOURCE_API_VERSION}")
             
-            data = self.api_client._make_request(url)
+            data = self.api_client.get(url)
             
             for resource in data.get('value', []):
                 resource_name = resource.get('name', 'Unknown')
@@ -1486,8 +1467,7 @@ class ARAApplication:
             
             # Initialize API clients with rate limiting
             api_client = AzureAPIClient(token, api_delay=args.api_delay)
-            if not api_client.test_authentication():
-                return ARAConfig.EXIT_CODE_ERROR
+            api_client.get(api_client.url("/subscriptions"), {"api-version": ARAConfig.AZURE_API_VERSION})
             
             # Initialize basic clients
             mg_client = ManagementGroupClient(api_client)
