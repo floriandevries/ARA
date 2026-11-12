@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Azure Role Assignment Exporter (ARA)
-====================================
+ARA, the role atlas for Azure
+=============================
 
 A professional tool for exporting Azure role assignments at management group
 and subscription scopes with comprehensive reporting, PIM integration, and 

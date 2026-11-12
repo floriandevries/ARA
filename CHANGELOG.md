@@ -1,9 +1,40 @@
 # Changelog
 
-All notable changes to Azure Role Assignment Exporter (ARA) will be documented in this file.
+All notable changes to ARA (which began as the Azure Role Assignment Exporter) will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [3.0.0] - 2026-11-12
+
+### Breaking
+- Removed `--max-resources` and `--exclude-system`. `--exclude-managed-identities` replaces the latter and filters on the `ManagedIdentity` principal type.
+- `--format` now only accepts `csv`, which writes a CSV in addition to the always-written HTML and JSON files. It no longer chooses between JSON and CSV.
+- Output goes to `./results/` or `--output-dir`. Incomplete scans write `*.partial.*` files and never replace a complete result.
+- JSON metadata changed: added `schema_version`, `complete`, `failed_scopes`, `pim`, `pim_unavailable_scopes`, `names`, `management_groups_scanned`, `subscriptions_scanned`, `scopes_with_assignments`; removed `total_scopes_scanned` and the top-level `scopes_scanned`. Timestamps are UTC. `principal_name` may be `null`.
+- CSV has fixed columns and escapes cells that start with `=`, `+`, `-` or `@`.
+- New assignment type `Active`, for active assignments whose duration is unknown (`--skip-pim`, PIM refused, or no PIM record).
+- Exit codes: 0 complete, 1 fatal, 2 usage error, 3 incomplete with files written, 130 interrupted.
+- Keychain login removed. The interactive token prompt only appears in a terminal.
+- `Unknown` as a principal name now means not found in the directory. Names that could not be looked up are `null`.
+- A depth that does not fit the scope kind is a usage error. Default depth: `management-groups` for a management group, `resource-groups` for a subscription.
+
+### Added
+- Self-contained HTML report for every scan, with search, filters, side panels, shareable views, CSV download, themes and print layout.
+- Pagination on every list call.
+- Tracking of failed scopes, with retries on 429, 5xx and connection errors.
+- `--output-dir`.
+- `AZURE_GRAPH_TOKEN` for Microsoft Graph name lookups.
+- Principal names from PIM first, then Microsoft Graph in batches.
+- `ManagedIdentity` principal type.
+- Unit test suite (`tests/test_ara.py`), no network needed.
+
+### Fixed
+- Missing pagination silently dropped role assignments in large scopes.
+- API errors were swallowed and a failed scan still reported success.
+- PIM deduplication hid active access: a principal who was eligible and activated now shows both rows.
+
+---
 
 ## [2.1.0] - 2026-02-05
 
@@ -102,7 +133,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Output Enhancements
 - **Console logging** shows breakdown by assignment type (e.g., "2 active permanent, 1 eligible permanent")
-- **Metadata tracking** for PIM scan status in output files
 
 ### Changed
 - **Version bumped to 2.0.0** (breaking changes)
@@ -112,8 +142,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **Duplicate fields bug** in RoleAssignment dataclass (removed duplicate scope, scope_name, scope_type fields)
-- **Better error handling** - split PIM exception handling with warning-level logging for partial failures
-- **Improved robustness** - PIM failures no longer silent, properly logged at warning level
 
 ### Technical Details
 - **Performance**: PIM adds 2 API calls per scope (eligible + time-bound active)

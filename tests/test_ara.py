@@ -563,5 +563,16 @@ class AuthTest(unittest.TestCase):
     def test_keychain_provider_is_gone(self):
         self.assertFalse(hasattr(ara, "KeychainAuthProvider"))
 
+class DocsTest(unittest.TestCase):
+    ROOT = pathlib.Path(__file__).resolve().parent.parent
+    def test_readme_matches_the_tool(self):
+        text = (self.ROOT / "README.md").read_text()
+        for flag in ("--output-dir", "--exclude-managed-identities", "--skip-pim", "--format csv"): self.assertIn(flag, text)
+        for gone in ("--max-resources", "--exclude-system", "Keychain", "PERFORMANCE.md", "2.0.0", "2.1.0", "LRU", "code%20style-black"):
+            self.assertNotIn(gone, text)
+        self.assertIn("3.0.0", text)
+    def test_changelog_has_3_0_0(self):
+        self.assertIn("## [3.0.0]", (self.ROOT / "CHANGELOG.md").read_text())
+
 if __name__ == "__main__":
     unittest.main()
