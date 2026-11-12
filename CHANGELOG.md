@@ -18,13 +18,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Keychain login removed. The interactive token prompt only appears in a terminal.
 - `Unknown` as a principal name now means not found in the directory. Names that could not be looked up are `null`.
 - A depth that does not fit the scope kind is a usage error. Default depth: `management-groups` for a management group, `resource-groups` for a subscription.
+- `--principal-name-filter` and `--exclude-managed-identities` exit 1 without a working Microsoft Graph token. ARA tests the token with one Graph call before scanning.
+- If the Graph lookup fails during the scan, these filters are not applied even when PIM named every principal; the scan counts as incomplete (exit code 3).
+- Child resources (for example subnets) are now included at `--depth resources`.
+- `assignments_before_filters` is in the metadata.
+- When PIM refuses only one of its two lists on a scope, the list that was readable is kept; the scope is still listed in `pim_unavailable_scopes`.
 
 ### Added
 - Self-contained HTML report for every scan, with search, filters, side panels, shareable views, CSV download, themes and print layout.
 - Pagination on every list call.
 - Tracking of failed scopes, with retries on 429, 5xx and connection errors.
 - `--output-dir`.
-- `AZURE_GRAPH_TOKEN` for Microsoft Graph name lookups.
+- `AZURE_GRAPH_TOKEN` for Microsoft Graph name lookups. A Graph token from the Azure CLI is renewed when it expires.
 - Principal names from PIM first, then Microsoft Graph in batches.
 - `ManagedIdentity` principal type.
 - Unit test suite (`tests/test_ara.py`), no network needed.

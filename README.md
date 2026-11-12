@@ -7,6 +7,8 @@ ARA, the role atlas for Azure. See who holds the keys.
 
 ARA scans a management group or a subscription and writes a report of who holds which Azure role, and where. Anyone with read access to the environment can run it. It is one Python file with no dependencies.
 
+Only direct assignments at or below the scanned scope are listed; assignments inherited from above it are not.
+
 ## What a scan writes
 
 Every scan writes two files into `results/` (or the directory you give with `--output-dir`):
@@ -106,7 +108,7 @@ ARA tries these in order:
 
 Principal names from Microsoft Graph use their own token: `AZURE_GRAPH_TOKEN` if set, otherwise the Azure CLI. Tokens are never printed or logged.
 
-With the Azure CLI, an expired token is renewed once during the scan. With a token you supplied, the scan stops when it expires.
+With the Azure CLI, an expired token is renewed when it expires during the scan. With a token you supplied, the scan stops when it expires.
 
 ## PIM and assignment types
 
@@ -120,7 +122,7 @@ Unless you pass `--skip-pim`, ARA also reads Privileged Identity Management. Eve
 | `Eligible time-bound` | Can be activated, with an end date |
 | `Active` | Assigned now, duration unknown |
 
-`Active` appears when ARA has no PIM record for an assignment: with `--skip-pim`, when PIM refused access, and for a few assignments PIM does not report. It does not mean permanent.
+`Active` appears when ARA has no PIM record for an assignment: with `--skip-pim`, when PIM refused access, and for a few assignments PIM does not report. It does not mean permanent. With `--skip-pim`, eligible assignments are not listed. Where PIM data could not be read in full, eligible assignments may be missing and active assignments may have the type `Active`.
 
 Eligible rows are separate rows. Someone who is eligible and has activated the role appears twice: once as eligible, once as active.
 
@@ -145,7 +147,7 @@ Filters apply to the output. Values are comma-separated; unknown values are a us
 | `--principal-name-filter "^Admin"` | Principal name, regex, case-insensitive |
 | `--exclude-managed-identities` | Leaves out managed identities |
 
-`--principal-name-filter` and `--exclude-managed-identities` need a Microsoft Graph token. ARA checks this before scanning and stops with exit code 1 if it has none. If the scan runs but Graph could not name every principal, these two filters are not applied: the report shows every assignment and says so in a banner. The scan then counts as incomplete (exit code 3) and the output goes to the `.partial` files.
+`--principal-name-filter` and `--exclude-managed-identities` need a Microsoft Graph token. ARA checks this before scanning and stops with exit code 1 if it has none. If the scan runs but the Graph lookup failed or left principals unnamed, no filters are applied: the report shows every assignment and says so in a banner. The scan then counts as incomplete (exit code 3) and the output goes to the `.partial` files.
 
 ## Output
 
@@ -200,7 +202,7 @@ If a scope could not be read, or the scan was stopped, ARA still writes what it 
 
 - **No token found**: run `az login`, or pass `--token`, or set `AZURE_ACCESS_TOKEN`.
 - **Exit code 3 or a banner about failed scopes**: the failed scopes and their errors are in the JSON under `failed_scopes`. Check that you have read access there, then run again.
-- **PIM banner**: your account may lack permission to read PIM schedules. Assignments then have the type `Active`. Use `--skip-pim` to skip PIM on purpose.
+- **PIM banner**: your account may lack permission to read PIM schedules. Eligible assignments may then be missing and active assignments may have the type `Active`. Use `--skip-pim` to skip PIM on purpose.
 - **Rows named `Unknown` or showing IDs**: see Principal names. For names beyond PIM you need a Graph token (`az login`, or `AZURE_GRAPH_TOKEN`).
 - **Throttling (429)**: ARA tries each request up to four times. Raise `--api-delay` if it keeps happening.
 - **`--principal-name-filter` stops immediately**: it needs a Graph token, see Filters.
