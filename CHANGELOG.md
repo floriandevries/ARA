@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Principal names from PIM first, then Microsoft Graph in batches.
 - `ManagedIdentity` principal type.
 - Unit test suite (`tests/test_ara.py`), no network needed.
+- `principal_upn` in the JSON rows: the user principal name from Microsoft Graph. The report's side panel shows it under the name.
+- A scan of a subscription or of the tenant root group is named after its display name, in the file name and the report heading.
 
 ### Fixed
 - Missing pagination silently dropped role assignments in large scopes.

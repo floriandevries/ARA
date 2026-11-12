@@ -50,7 +50,8 @@ def rows(n: int):
             principal_type=ptype, role_name=ROLES[i % len(ROLES)], role_id="r{}".format(i % len(ROLES)),
             scope=path, scope_name=scope_name, scope_type=scope_type, resource_type=rtype, assignment_type=atype,
             start_date_time="2026-01-01T00:00:00Z" if bound else None,
-            end_date_time="2026-12-{:02d}T17:00:00Z".format(1 + i % 28) if bound else None)
+            end_date_time="2026-12-{:02d}T17:00:00Z".format(1 + i % 28) if bound else None,
+            principal_upn="user{:03d}@example.org".format(k) if ptype == "User" and k % 12 == 0 else None)
 
 
 def main() -> None:

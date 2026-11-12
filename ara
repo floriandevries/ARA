@@ -50,7 +50,7 @@ __author__ = "fjdev"
 class ARAConfig:
     """Configuration constants for ARA."""
     DESCRIPTOR = "the role atlas for Azure"
-    SLOGAN = "See who holds the keys."
+    SLOGAN = "Who can do what, and where."
 
     # API Endpoints
     AZURE_MANAGEMENT_URL = "https://management.azure.com"
@@ -389,7 +389,8 @@ class RoleAssignment:
     assignment_type: str = "Active permanent"  # "Active permanent", "Active time-bound", "Eligible permanent", "Eligible time-bound"
     start_date_time: Optional[str] = None  # ISO 8601 format
     end_date_time: Optional[str] = None  # ISO 8601 format
-    
+    principal_upn: Optional[str] = None  # userPrincipalName from Microsoft Graph
+
     def __post_init__(self):
         """Validate data after initialization."""
         if not self.principal_id:
@@ -889,9 +890,11 @@ class PIMCollector:
 class AssignmentBuilder:
     """Turns RBAC rows and PIM schedule instances into RoleAssignments."""
 
-    def __init__(self, role_names: Dict[str, str], subscription_names: Dict[str, str]):
+    def __init__(self, role_names: Dict[str, str], subscription_names: Dict[str, str],
+                 management_group_names: Optional[Dict[str, str]] = None):
         self.role_names = role_names  # lowercased role definition GUID to name
         self.subscription_names = subscription_names  # lowercased subscription GUID to display name
+        self.management_group_names = management_group_names or {}  # lowercased management group id to display name
 
     def build(self, rbac_rows: List[Dict], active_instances: Optional[List[Dict]],
               eligible_instances: Optional[List[Dict]]) -> List[RoleAssignment]:
@@ -921,6 +924,8 @@ class AssignmentBuilder:
             name = scope.name
             if scope.scope_type == 'Subscription':
                 name = self.subscription_names.get(scope.subscription_id.lower()) or name
+            elif scope.scope_type == 'Management Group':
+                name = self.management_group_names.get(name.lower()) or name
             out.append(RoleAssignment(
                 principal_id=props.get('principalId', ''),
                 principal_name=(expanded.get('principal') or {}).get('displayName') or None,
@@ -962,14 +967,17 @@ class Scanner:
             mgs, subs = self.hierarchy.management_group_tree(ref.name)
         else:
             mgs, subs = [], [self.hierarchy.subscription(ref.name)]
-        result = ScanResult(ref.path, ref.name, depth, timestamp, [], pim_skipped=self.pim is None)
+        root = (mgs or subs)[0]  # the scanned scope; its name is the display name when Azure gave one
+        name = root.name if ScopeParser._GUID_RE.match(ref.name) else ref.name
+        result = ScanResult(ref.path, name, depth, timestamp, [], pim_skipped=self.pim is None)
         sub_names = {s.subscription_id.lower(): s.name for s in subs}
+        mg_names = {m.scope_path.rsplit('/', 1)[-1].lower(): m.name for m in mgs}
         scopes = mgs + ([] if depth == ARAConfig.DEPTH_MANAGEMENT_GROUPS else subs)
         try:
             with ProgressTracker(total=len(scopes), desc="Scanning scopes", disable=not self.show_progress) as progress:
                 for scope in scopes:
                     try:
-                        self._scan_one(scope, depth, resource_types, sub_names, result)
+                        self._scan_one(scope, depth, resource_types, sub_names, mg_names, result)
                     except APIError as e:
                         result.failed_scopes.append({"scope": scope.scope_path, "error": str(e)})
                     progress.update(1)
@@ -983,7 +991,7 @@ class Scanner:
         return result
 
     def _scan_one(self, scope: Scope, depth: str, resource_types: Optional[List[str]],
-                  sub_names: Dict[str, str], result: ScanResult) -> None:
+                  sub_names: Dict[str, str], mg_names: Dict[str, str], result: ScanResult) -> None:
         is_mg = scope.scope_type == 'Management Group'
         role_names = self.collector.role_names(scope.scope_path)
         rows = self.collector.for_management_group(scope) if is_mg else self.collector.for_subscription(scope)
@@ -1002,7 +1010,7 @@ class Scanner:
                 if not result.pim_unavailable_scopes:
                     logger.warning("PIM data is not readable with this account; affected assignments get the type 'Active'.")
                 result.pim_unavailable_scopes.append(scope.scope_path)
-        built = AssignmentBuilder(role_names, sub_names).build(rows, active, eligible)
+        built = AssignmentBuilder(role_names, sub_names, mg_names).build(rows, active, eligible)
         result.assignments.extend(a for a in built if DepthFilter.keep(Scope.from_path(a.scope), depth, resource_types))
         if is_mg:
             result.management_groups_scanned += 1
@@ -1059,7 +1067,7 @@ class PrincipalResolver:
             return assignment if assignment.principal_name else replace(assignment, principal_name="Unknown")
         principal_type = 'ManagedIdentity' if obj.get('servicePrincipalType') == 'ManagedIdentity' else assignment.principal_type
         return replace(assignment, principal_name=obj.get('displayName') or assignment.principal_name,
-                       principal_type=principal_type)
+                       principal_type=principal_type, principal_upn=obj.get('userPrincipalName'))
 
 
 # Output Handlers
@@ -1137,10 +1145,6 @@ REPORT_TEMPLATE = r"""<!DOCTYPE html>
 <link rel="icon" href="data:,">
 <title>ARA report</title>
 <style>
-/* Hallmark · shape: app screen · genre: modern-minimal · theme: custom
- * nav: none, a header carrying the scope and the scan facts · signature: the assignment table and its side panel · states: empty, no match, full
- * axes: warm paper/system sans/teal · posture: restrained · contrast: pass · modes: light+dark · v2.0.0 */
-/* Hallmark · pre-emit critique: P4 H4 E4 S4 R5 V3 · weakest: V, it follows view A of the agreed mockup on purpose, so the table stays the first thing below the figures */
 :root {
   color-scheme: light;
   --color-paper: oklch(97.2% 0.006 95);
@@ -1244,6 +1248,7 @@ h1, h2 { font-weight: 600; line-height: 1.15; text-wrap: balance; overflow-wrap:
 .risk { color: var(--color-risk); font-weight: 600; }
 
 .banner { background: var(--color-notice); border-radius: var(--radius-well); padding: var(--space-sm) var(--space-md); margin-bottom: var(--space-lg); display: grid; gap: var(--space-2xs); }
+.banner ul { padding-left: var(--space-md); font-size: var(--text-sm); overflow-wrap: anywhere; }
 
 .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: var(--space-xl); }
 .stats div { display: flex; flex-direction: column-reverse; padding-inline: var(--space-lg); border-left: 1px solid var(--color-rule); }
@@ -1362,12 +1367,12 @@ document.addEventListener("DOMContentLoaded", () => {
   const eligible = (r) => r.assignment_type.indexOf("Eligible") === 0;
   const ends = (r) => r.end_date_time ? when(r.end_date_time, day) : (r.assignment_type === "Active" ? "Not known" : "No end date");
   rows.forEach((r) => {
-    r.search = [r.principal_name, r.principal_id, r.role_name, r.scope_name, r.scope, r.principal_type,
+    r.search = [r.principal_name, r.principal_upn, r.principal_id, r.role_name, r.scope_name, r.scope, r.principal_type,
       r.scope_type, r.resource_type, r.assignment_type].filter(Boolean).join("\n").toLowerCase();
   });
 
   // Heading
-  const scopeName = meta.scope.split("/").filter(Boolean).pop() || meta.scope;
+  const scopeName = report.scope_name;
   $("scope").textContent = scopeName;
   document.title = "ARA, " + scopeName;
   const time = el("time", null, when(meta.scan_timestamp, stamp));
@@ -1393,6 +1398,16 @@ document.addEventListener("DOMContentLoaded", () => {
   const filters = Object.keys(meta.filters_applied);
   if (filters.length) notes.push("Filters were applied at scan time (" + filters.map((k) => k + ": " + meta.filters_applied[k]).join("; ") + "); the report shows only matching assignments.");
   notes.forEach((n) => $("banner").appendChild(el("p", null, n)));
+  if (failed) {
+    // Scope paths and errors come from Azure: text only.
+    const list = el("ul");
+    meta.failed_scopes.slice(0, 10).forEach((f) => {
+      const error = f.error.length > 120 ? f.error.slice(0, 119) + "…" : f.error;
+      list.appendChild(el("li", null, f.scope + ": " + error));
+    });
+    if (failed > 10) list.appendChild(el("li", null, "and " + (failed - 10) + " more; the JSON file lists all of them."));
+    $("banner").insertBefore(list, $("banner").children[1] || null);
+  }
   $("banner").hidden = notes.length === 0;
 
   // Figures
@@ -1510,6 +1525,9 @@ document.addEventListener("DOMContentLoaded", () => {
       : rows.filter((x) => x.scope.toLowerCase() === r.scope.toLowerCase());
     $("panel-title").textContent = byPrincipal ? who(r) : r.scope_name;
     $("panel-sub").textContent = (byPrincipal ? r.principal_type : scopeKind(r)) + ", " + plural(items.length, "assignment", "assignments");
+    $("panel-upn").textContent = byPrincipal && r.principal_upn ? r.principal_upn : "";
+    $("panel-upn").hidden = !$("panel-upn").textContent;
+    $("panel-id-label").hidden = !byPrincipal;
     $("panel-id").textContent = byPrincipal ? r.principal_id : r.scope;
     $("copy").textContent = "Copy";
     const list = document.createDocumentFragment();
@@ -1632,9 +1650,10 @@ document.addEventListener("DOMContentLoaded", () => {
     <h2 id="panel-title"></h2>
     <button class="btn" id="close" type="button">Close</button>
   </div>
+  <p class="sub" id="panel-upn" hidden></p>
   <p class="sub" id="panel-sub"></p>
   <div class="panel-ref">
-    <p class="panel-id" id="panel-id"></p>
+    <p class="panel-id"><span id="panel-id-label">Object ID: </span><span id="panel-id"></span></p>
     <button class="btn" id="copy" type="button">Copy</button>
   </div>
   <ul id="panel-list"></ul>
@@ -1664,6 +1683,7 @@ class HTMLOutputHandler(OutputHandler):
             "slogan": ARAConfig.SLOGAN,
             "filters_not_applied": results.filters_not_applied,  # not in metadata, but the banner needs it
             "stopped": results.stopped or results.interrupted,
+            "scope_name": results.scope_name,
         }
         return REPORT_TEMPLATE.replace("/*ARA_DATA*/", self.embed(data))
 

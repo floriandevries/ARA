@@ -1,6 +1,6 @@
 # ARA
 
-ARA, the role atlas for Azure. See who holds the keys.
+ARA, the role atlas for Azure. Who can do what, and where.
 
 [![Python 3.7+](https://img.shields.io/badge/python-3.7+-blue.svg)](https://www.python.org/downloads/)
 [![Version](https://img.shields.io/badge/version-3.0.0-green.svg)](CHANGELOG.md)
@@ -17,6 +17,8 @@ Every scan writes two files into `results/` (or the directory you give with `--o
 - `role_assignments_<scope>.json`: the same data, with scan metadata.
 
 `--format csv` also writes `role_assignments_<scope>.csv`.
+
+`<scope>` is the scope id. A scan of a subscription or of the tenant root group, whose ids are GUIDs, is named after its display name instead, for example `role_assignments_Sandbox.html` or `role_assignments_Tenant_Root_Group.html`.
 
 ### The report
 
@@ -178,7 +180,7 @@ Filters apply to the output. Values are comma-separated; unknown values are a us
 }
 ```
 
-`failed_scopes` is a list of `{"scope": "...", "error": "..."}`. `principal_name` is `null` when no name was found. The timestamp is UTC.
+`failed_scopes` is a list of `{"scope": "...", "error": "..."}`. `principal_name` is `null` when no name was found. Each row has `principal_upn`, the user principal name from Microsoft Graph; it is `null` for groups and service principals, and when Graph was not used. The timestamp is UTC.
 
 ### CSV
 

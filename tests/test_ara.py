@@ -230,6 +230,11 @@ class AssignmentBuilderTest(unittest.TestCase):
         out = self.builder().build([row(self.S, id_="a"), row(self.S + "/resourceGroups/rg/providers/Microsoft.Network/virtualNetworks/v/subnets/s", id_="b")], None, None)
         self.assertEqual((out[0].scope_name, out[0].scope_type), ("Prod", "Subscription"))
         self.assertEqual((out[1].scope_name, out[1].resource_type), ("s", "Microsoft.Network/virtualNetworks/subnets"))
+    def test_management_group_rows_get_the_display_name(self):
+        root = "/providers/Microsoft.Management/managementGroups/" + G
+        b = ara.AssignmentBuilder({}, {}, {G: "Tenant Root Group"})
+        self.assertEqual([(a.scope_name, a.scope) for a in b.build([row(root, id_="a"), row(MG, id_="b")], None, None)],
+                         [("Tenant Root Group", root), ("my-mg", MG)])
     def test_bad_row_is_skipped_with_warning(self):
         ara.logger.disabled = False
         try:
@@ -353,6 +358,21 @@ class ScannerTest(unittest.TestCase):
                          ("ARA", "3.0.0", 3, True, "included", "subscriptions"))
         self.assertRegex(m["scan_timestamp"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
         for gone in ("total_scopes_scanned",): self.assertNotIn(gone, m)
+    def test_subscription_scan_is_named_after_its_display_name(self):
+        h = FakeHierarchy()
+        h.subscription = lambda sid: ara.Scope("/subscriptions/" + sid, "Sandbox", "Subscription", subscription_id=sid)
+        ref = ara.ScopeParser.parse("/subscriptions/" + G)
+        r = ara.Scanner(h, FakeCollector({}), None, show_progress=False).scan(ref, "subscriptions")
+        self.assertEqual((r.scope_name, r.to_dict()["metadata"]["scope"]), ("Sandbox", ref.path))
+    def test_guid_management_group_is_named_after_its_display_name(self):
+        ref = ara.ScopeParser.parse("managementGroups/" + G)
+        root = ara.Scope(ref.path, "Tenant Root Group", "Management Group")
+        r = ara.Scanner(FakeHierarchy([root]), FakeCollector({}), None, show_progress=False).scan(ref, "management-groups")
+        self.assertEqual((r.scope_name, r.scope), ("Tenant Root Group", ref.path))
+    def test_readable_management_group_id_is_kept(self):
+        root = ara.Scope(MG, "My MG", "Management Group")
+        r = ara.Scanner(FakeHierarchy([root]), FakeCollector({}), None, show_progress=False).scan(self.ref(), "management-groups")
+        self.assertEqual(r.scope_name, "my-mg")
 
 def ra(name="Ann", pid="p1", ptype="User", role="Reader", atype="Active permanent"):
     return ara.RoleAssignment(principal_id=pid, principal_name=name, principal_type=ptype, role_name=role,
@@ -393,6 +413,14 @@ class PrincipalResolverTest(unittest.TestCase):
     def test_graph_failure_never_writes_unknown(self):
         out, status = ara.PrincipalResolver(FakeGraph({}, error=ara.APIError("x", status=500))).resolve([ra(name=None)])
         self.assertEqual((out[0].principal_name, status), (None, "unavailable"))
+    def test_graph_sets_user_principal_name(self):
+        out, _ = ara.PrincipalResolver(FakeGraph({"a": {"displayName": "Ann", "userPrincipalName": "ann@contoso.com"}})).resolve([ra(pid="a")])
+        self.assertEqual(out[0].principal_upn, "ann@contoso.com")
+    def test_without_graph_user_principal_name_is_none(self):
+        out, _ = ara.PrincipalResolver(None).resolve([ra()])
+        self.assertIsNone(out[0].principal_upn)
+    def test_user_principal_name_is_in_json_rows(self):
+        self.assertIn("principal_upn", result([ra()]).to_dict()["role_assignments"][0])
     def test_get_by_ids_chunks_by_1000(self):
         opener = FakeOpener([{"value": []}, {"value": []}, {"value": []}])
         g = ara.GraphAPIClient("t", api_delay=0, opener=opener, sleep=lambda s: None)
@@ -500,6 +528,14 @@ class HTMLReportExtrasTest(unittest.TestCase):
     def test_still_no_html_injection_or_external_urls(self):
         for banned in ("innerHTML", "insertAdjacentHTML", "outerHTML", "document.write"): self.assertNotIn(banned, self.T)
         self.assertIsNone(re.search(r"https?://", self.T))
+    def test_no_hallmark_stamp(self):
+        self.assertNotIn("hallmark", self.T.lower())
+    def test_panel_labels_the_object_id(self):
+        self.assertIn("Object ID", self.T)
+    def test_heading_uses_the_scan_scope_name(self):
+        r = result([]); r.scope_name = "Sandbox"
+        self.assertEqual(HTMLReportTest().data(ara.HTMLOutputHandler("x").render(r))["report"]["scope_name"], "Sandbox")
+        self.assertIn("report.scope_name", self.T)
     def test_twenty_thousand_rows_stay_under_fifteen_megabytes(self):
         html = ara.HTMLOutputHandler("x").render(result([ra(pid="p%d" % i) for i in range(20000)]))
         self.assertLess(len(html.encode("utf-8")), 15 * 1024 * 1024)
